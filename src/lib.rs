@@ -6,11 +6,6 @@
 //! detect this, and scale the thread pool.
 
 #[macro_use]
-extern crate lazy_static;
-#[macro_use]
-extern crate log;
-
-#[macro_use]
 mod utils;
 
 mod executor;

@@ -1,5 +1,7 @@
 use std::time::Instant;
 
+use lazy_static::lazy_static;
+
 pub fn abort_on_panic(f: impl FnOnce()) {
   struct Bomb;
 
