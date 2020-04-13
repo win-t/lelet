@@ -14,9 +14,10 @@ use crate::utils::monotonic_ms;
 
 use super::processor::Processor;
 use super::Task;
-use super::BLOCKING_THRESHOLD;
 
-pub struct Runtime {
+const BLOCKING_THRESHOLD: Duration = Duration::from_millis(10);
+
+pub struct SysMon {
   // the global queue
   injector: Injector<Task>,
 
@@ -32,11 +33,11 @@ pub struct Runtime {
   steal_index_hint: AtomicUsize,
 }
 
-pub static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
+pub static SYSMON: Lazy<SysMon> = Lazy::new(|| {
   let num_cpus = std::cmp::max(num_cpus::get(), 1);
   let (s, r) = bounded(num_cpus);
 
-  let runtime = Runtime {
+  let sysmon = SysMon {
     injector: Injector::new(),
     injector_hint_sender: s,
     injector_hint_reciever: r,
@@ -48,12 +49,15 @@ pub static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
     steal_index_hint: AtomicUsize::new(0),
   };
 
-  thread::spawn(|| abort_on_panic(|| RUNTIME.main()));
+  thread::Builder::new()
+    .name("lelet/sysmon".into())
+    .spawn(|| abort_on_panic(|| SYSMON.main()))
+    .expect("Cannot spawn lelet/sysmon thread");
 
-  runtime
+  sysmon
 });
 
-impl Runtime {
+impl SysMon {
   fn main(&self) {
     let mut delay = BLOCKING_THRESHOLD;
     loop {
@@ -67,7 +71,7 @@ impl Runtime {
       let mut replacement: Vec<_> = self
         .processors
         .iter()
-        .filter(|p| p.get_last_seen() < must_seen_at)
+        .filter(|p| !p.is_parking() && p.get_last_seen() < must_seen_at)
         .map(|p| p.clone())
         .zip(std::iter::repeat_with(|| Processor::new()))
         .collect();
@@ -99,6 +103,7 @@ impl Runtime {
         self
           .processors
           .iter()
+          .filter(|p| !p.is_parking())
           .map(|p| p.get_last_seen())
           .chain(std::iter::once(now))
           .min()
@@ -145,7 +150,7 @@ impl Runtime {
       })
   }
 
-  pub fn park_timeout(&self, d: Duration) {
-    let _ = self.injector_hint_reciever.recv_timeout(d);
+  pub fn park(&self) {
+    let _ = self.injector_hint_reciever.recv();
   }
 }

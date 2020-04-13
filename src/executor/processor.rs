@@ -10,12 +10,12 @@ use crate::utils::abort_on_panic;
 use crate::utils::monotonic_ms;
 
 use super::Task;
-use super::BLOCKING_THRESHOLD;
-use super::RUNTIME;
+use super::SYSMON;
 use super::WORKER;
 
 pub struct Processor {
   valid: AtomicBool,
+  parked: AtomicBool,
   last_seen: AtomicU64,
   stealer: Stealer<Task>,
   steal_all_sender: Sender<Stealer<Task>>,
@@ -25,7 +25,6 @@ pub struct Processor {
 macro_rules! run_task {
   ($self:ident, $task:ident, $counter:ident) => {{
     $task.run();
-    $self.tick();
     $counter += 1;
     if !$self.still_valid() {
       return;
@@ -39,6 +38,7 @@ impl Processor {
     let (s, r) = unbounded();
     let processor = Arc::new(Processor {
       valid: AtomicBool::new(true),
+      parked: AtomicBool::new(false),
       last_seen: AtomicU64::new(monotonic_ms()),
       stealer: worker.stealer(),
       steal_all_sender: s,
@@ -57,7 +57,7 @@ impl Processor {
     // push remaining task to global queue before leaving
     defer! {
       while let Some(task) = worker.pop() {
-        RUNTIME.push_task(task);
+        SYSMON.push_task(task);
       }
     }
 
@@ -67,15 +67,15 @@ impl Processor {
       WORKER.with(|worker_tls| { worker_tls.borrow_mut().take(); } );
     }
 
-    self.tick();
-
     // Number of runs in a row before the global queue is inspected.
     const MAX_RUNS: u64 = 64;
     let mut counter: u64 = 0;
     loop {
+      self.tick();
+
       if counter > MAX_RUNS {
         counter = 0;
-        match RUNTIME.pop_task(&worker) {
+        match SYSMON.pop_task(&worker) {
           Some(task) => run_task!(self, task, counter),
           None => {}
         }
@@ -86,7 +86,7 @@ impl Processor {
         continue;
       }
 
-      match RUNTIME.pop_task(&worker) {
+      match SYSMON.pop_task(&worker) {
         Some(task) => {
           run_task!(self, task, counter);
           continue;
@@ -96,18 +96,16 @@ impl Processor {
 
       match self.steal_all_receiver.try_recv() {
         Ok(stealer) => {
-          loop {
-            match stealer.steal_batch(&worker) {
-              Steal::Empty => break,
-              _ => {}
-            }
+          match stealer.steal_batch(&worker) {
+            Steal::Empty => {}
+            _ => self.steal_all_sender.send(stealer).unwrap(),
           }
           continue;
         }
         _ => {}
       }
 
-      match RUNTIME.steal_task(&worker) {
+      match SYSMON.steal_task(&worker) {
         Some(task) => {
           run_task!(self, task, counter);
           continue;
@@ -115,12 +113,18 @@ impl Processor {
         None => {}
       }
 
-      RUNTIME.park_timeout(BLOCKING_THRESHOLD / 2);
+      self.parked.store(true, Ordering::Relaxed);
+      SYSMON.park();
+      self.parked.store(false, Ordering::Relaxed);
     }
   }
 
   fn tick(&self) {
     self.last_seen.store(monotonic_ms(), Ordering::Relaxed);
+  }
+
+  pub fn is_parking(&self) -> bool {
+    self.parked.load(Ordering::Relaxed)
   }
 
   pub fn get_last_seen(&self) -> u64 {

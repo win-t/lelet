@@ -8,18 +8,15 @@
 // A thread without valid "processor" should terminate and should not execute more task.
 
 mod processor;
-mod runtime;
+mod sysmon;
 
 use std::cell::RefCell;
 use std::future::Future;
 use std::rc::Rc;
-use std::time::Duration;
 
 use crossbeam_deque::Worker;
 
-use self::runtime::RUNTIME;
-
-const BLOCKING_THRESHOLD: Duration = Duration::from_millis(10);
+use self::sysmon::SYSMON;
 
 type Task = async_task::Task<()>;
 
@@ -35,7 +32,7 @@ fn schedule_task(task: Task) {
     let worker = worker.borrow();
     match worker.as_ref() {
       Some(worker) => worker.push(task),
-      None => RUNTIME.push_task(task),
+      None => SYSMON.push_task(task),
     }
   });
 }
