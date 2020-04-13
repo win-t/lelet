@@ -32,10 +32,7 @@ impl Pool {
     self.sender.try_send(job).unwrap_or_else(|err| match err {
       TrySendError::Full(job) => {
         let receiver = self.receiver.clone();
-        thread::Builder::new()
-          .name("lelet/pool".into())
-          .spawn(move || thread_main(receiver))
-          .expect("Cannot spawn lelet/pool thread");
+        thread::spawn(move || thread_main(receiver));
         self.sender.send(job).unwrap();
       }
       // will never disconnected, because we holding reciever for cloning

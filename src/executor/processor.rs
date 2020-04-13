@@ -16,6 +16,7 @@ use super::SYSMON;
 use super::WORKER;
 
 pub struct Processor {
+  id: u64,
   valid: AtomicBool,
   is_parking: &'static AtomicBool,
   last_seen: &'static AtomicU64,
@@ -24,11 +25,26 @@ pub struct Processor {
   steal_all_receiver: Receiver<Stealer<Task>>,
 }
 
+impl std::fmt::Debug for Processor {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.write_str(&format!("Processor({})", self.id))
+  }
+}
+
+impl Drop for Processor {
+  fn drop(&mut self) {
+    trace!("{:?} is destroyed", self);
+  }
+}
+
+static COUNTER: AtomicU64 = AtomicU64::new(0);
+
 impl Processor {
   pub fn new(is_parking: &'static AtomicBool, last_seen: &'static AtomicU64) -> Arc<Processor> {
     let worker = Worker::new_fifo();
     let (s, r) = unbounded();
     let processor = Arc::new(Processor {
+      id: COUNTER.fetch_add(1, Ordering::Relaxed),
       valid: AtomicBool::new(true),
       is_parking,
       last_seen,
@@ -40,6 +56,9 @@ impl Processor {
       let processor = processor.clone();
       thread_pool::spawn_box(Box::new(move || abort_on_panic(|| processor.main(worker))));
     }
+
+    trace!("{:?} is created", processor);
+
     processor
   }
 

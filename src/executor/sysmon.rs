@@ -15,7 +15,8 @@ use crate::utils::monotonic_ms;
 use super::processor::Processor;
 use super::Task;
 
-const BLOCKING_THRESHOLD: Duration = Duration::from_millis(10);
+// how long a processor considered to be blocking
+const BLOCKING_THRESHOLD: Duration = Duration::from_millis(100);
 
 pub struct SysMon {
   // the global queue
@@ -67,10 +68,7 @@ pub static SYSMON: Lazy<SysMon> = Lazy::new(|| {
     steal_index_hint: AtomicUsize::new(0),
   };
 
-  thread::Builder::new()
-    .name("lelet/sysmon".into())
-    .spawn(|| abort_on_panic(|| SYSMON.main()))
-    .expect("Cannot spawn lelet/sysmon thread");
+  thread::spawn(|| abort_on_panic(|| SYSMON.main()));
 
   sysmon
 });
@@ -92,6 +90,8 @@ impl SysMon {
         }
 
         let current: &Arc<Processor> = &self.processors[i];
+        trace!("{:?} is blocking", current);
+
         current.mark_invalid();
 
         // this is safe as long:
@@ -99,7 +99,6 @@ impl SysMon {
         // 2. processor never access it after mark_invalid() is called
         let is_parking_ref: &'static AtomicBool = unsafe { transmute(is_parking) };
         let last_seen_ref: &'static AtomicU64 = unsafe { transmute(last_seen) };
-
         let new: &Arc<Processor> = &Processor::new(is_parking_ref, last_seen_ref);
         new.steal_all(current.get_stealer().clone());
 
