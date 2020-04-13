@@ -10,29 +10,11 @@
 mod processor;
 mod sysmon;
 
-use std::cell::RefCell;
 use std::future::Future;
-use std::rc::Rc;
 
-use crossbeam_deque::Worker;
-
-use self::sysmon::SYSMON;
+use self::processor::schedule_task;
 
 type Task = async_task::Task<()>;
-
-thread_local! {
-  // Indicating that current thread have worker queue
-  static WORKER: RefCell<Option<Rc<Worker<Task>>>> = RefCell::new(None);
-}
-
-// if current thread have worker queue, schedule the task to it
-// otherwise schedule it to global queue
-fn schedule_task(task: Task) {
-  WORKER.with(|worker| match worker.borrow().as_ref() {
-    Some(worker) => worker.push(task),
-    None => SYSMON.push_task(task),
-  });
-}
 
 /// Run the task.
 ///

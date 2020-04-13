@@ -30,7 +30,7 @@ pub struct SysMon {
   processors: Vec<Arc<Processor>>,
 
   // "is_parking" and "last_seen" is stored in this vec,
-  // so it is packed and more cache friendly
+  // so it is packed and more CPU cache friendly
   processors_status_storage: Vec<(AtomicBool, AtomicU64)>,
 
   // this hint will used to determine which processor
@@ -49,12 +49,14 @@ pub static SYSMON: Lazy<SysMon> = Lazy::new(|| {
 
   let mut processors = Vec::new();
   for i in 0..num_cpus {
+    let (ref is_parking, ref last_seen) = processors_status_storage[i];
+
     // this is safe, because processors_status_storage is
     // intialized once and never get droped (basically it is static)
-    let is_parking_ref: &'static AtomicBool = unsafe { transmute(&processors_status_storage[i].0) };
-    let last_seen_ref: &'static AtomicU64 = unsafe { transmute(&processors_status_storage[i].1) };
+    let is_parking = unsafe { transmute::<&AtomicBool, &'static AtomicBool>(is_parking) };
+    let last_seen = unsafe { transmute::<&AtomicU64, &'static AtomicU64>(last_seen) };
 
-    processors.push(Processor::new(is_parking_ref, last_seen_ref));
+    processors.push(Processor::new(is_parking, last_seen));
   }
 
   let sysmon = SysMon {
@@ -83,30 +85,29 @@ impl SysMon {
 
       for i in 0..self.processors_status_storage.len() {
         let (ref is_parking, ref last_seen) = self.processors_status_storage[i];
-        let is_parking: &AtomicBool = is_parking;
-        let last_seen: &AtomicU64 = last_seen;
         if is_parking.load(Ordering::Relaxed) || must_seen_at <= last_seen.load(Ordering::Relaxed) {
           continue;
         }
 
         let current: &Arc<Processor> = &self.processors[i];
-        trace!("{:?} is blocking", current);
-
         current.mark_invalid();
 
         // this is safe as long:
         // 1. see SYSMON initialization
         // 2. processor never access it after mark_invalid() is called
-        let is_parking_ref: &'static AtomicBool = unsafe { transmute(is_parking) };
-        let last_seen_ref: &'static AtomicU64 = unsafe { transmute(last_seen) };
-        let new: &Arc<Processor> = &Processor::new(is_parking_ref, last_seen_ref);
+        let is_parking = unsafe { transmute::<&AtomicBool, &'static AtomicBool>(is_parking) };
+        let last_seen = unsafe { transmute::<&AtomicU64, &'static AtomicU64>(last_seen) };
+
+        let new: &Arc<Processor> = &Processor::new(is_parking, last_seen);
         new.steal_all(current.get_stealer().clone());
+
+        trace!("{:?} is blocking, replacing with {:?}", current, new);
 
         // force swap on immutable processors list, atomic update the processor pointer
         // inside the list, others will see some inconsistency in the list, but that is okay
         unsafe {
-          let current = transmute::<&Arc<Processor>, &AtomicPtr<*mut Processor>>(current);
-          let new = transmute::<&Arc<Processor>, &AtomicPtr<*mut Processor>>(&new);
+          let current = transmute::<&Arc<Processor>, &AtomicPtr<Arc<Processor>>>(current);
+          let new = transmute::<&Arc<Processor>, &AtomicPtr<Arc<Processor>>>(&new);
           let old = current.swap(new.load(Ordering::SeqCst), Ordering::SeqCst);
           new.store(old, Ordering::SeqCst);
         }

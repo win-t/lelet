@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::hint::unreachable_unchecked;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -11,9 +12,8 @@ use crate::thread_pool;
 use crate::utils::abort_on_panic;
 use crate::utils::monotonic_ms;
 
+use super::sysmon::SYSMON;
 use super::Task;
-use super::SYSMON;
-use super::WORKER;
 
 pub struct Processor {
   id: u64,
@@ -27,7 +27,7 @@ pub struct Processor {
 
 impl std::fmt::Debug for Processor {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.write_str(&format!("Processor({})", self.id))
+    f.write_str(&format!("<Processor({})>", self.id))
   }
 }
 
@@ -35,6 +35,35 @@ impl Drop for Processor {
   fn drop(&mut self) {
     trace!("{:?} is destroyed", self);
   }
+}
+
+struct Queue(RefCell<Option<Task>>, Worker<Task>);
+
+impl Queue {
+  fn push(&self, task: Task) {
+    match self.0.borrow_mut().replace(task) {
+      None => {}
+      Some(task) => self.1.push(task),
+    }
+  }
+
+  fn pop(&self) -> Option<Task> {
+    match self.0.borrow_mut().take() {
+      Some(task) => Some(task),
+      None => self.1.pop(),
+    }
+  }
+}
+
+impl std::ops::Deref for Queue {
+  type Target = Worker<Task>;
+  fn deref(&self) -> &Worker<Task> {
+    &self.1
+  }
+}
+
+thread_local! {
+   static QUEUE: RefCell<Option<Rc<Queue>>> = RefCell::new(None);
 }
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -63,19 +92,22 @@ impl Processor {
   }
 
   fn main(&self, worker: Worker<Task>) {
-    let worker = Rc::new(worker);
+    let queue = Rc::new(Queue(RefCell::new(None), worker));
 
     // push remaining task to global queue before leaving
-    defer! {
-      while let Some(task) = worker.pop() {
-        SYSMON.push_task(task);
+    {
+      let queue = queue.clone();
+      defer! {
+        while let Some(task) = queue.pop() {
+          SYSMON.push_task(task);
+        }
       }
     }
 
     // set current thread worker queue, and unset it before leaving
-    WORKER.with(|worker_tls| worker_tls.borrow_mut().replace(worker.clone()));
+    QUEUE.with(|queue_tls| queue_tls.borrow_mut().replace(queue.clone()));
     defer! {
-      WORKER.with(|worker_tls| { worker_tls.borrow_mut().take(); } );
+      QUEUE.with(|queue_tls| { queue_tls.borrow_mut().take(); } );
     }
 
     // Number of runs in a row before the global queue is inspected.
@@ -100,16 +132,7 @@ impl Processor {
       macro_rules! pop_global {
         () => {{
           counter = 0;
-          match SYSMON.pop_task(&worker) {
-            Some(task) => run_task!(task),
-            None => {}
-          }
-        }};
-      }
-
-      macro_rules! steal_others {
-        () => {{
-          match SYSMON.steal_task(&worker) {
+          match SYSMON.pop_task(&queue) {
             Some(task) => run_task!(task),
             None => {}
           }
@@ -122,37 +145,41 @@ impl Processor {
         pop_global!();
       }
 
-      if let Some(task) = worker.pop() {
+      if let Some(task) = queue.pop() {
         run_task!(task);
       }
 
-      pop_global!();
-      steal_others!();
+      for i in 0..YIELDS + 1 {
+        if i > 0 {
+          thread::yield_now();
+        }
 
-      match self.steal_all_receiver.try_recv() {
-        Ok(stealer) => {
-          let steal = stealer.steal_batch_and_pop(&worker);
-          match steal {
-            Steal::Empty => {} // (*)
-            _ => {
-              // we are not done with this stealer yet
-              self.steal_all_sender.send(stealer).unwrap();
+        pop_global!();
 
-              match steal {
-                Steal::Success(task) => run_task!(task),
-                Steal::Empty => {}
-                Steal::Retry => unsafe { unreachable_unchecked() }, // (*)
+        match SYSMON.steal_task(&queue) {
+          Some(task) => run_task!(task),
+          None => {}
+        }
+
+        match self.steal_all_receiver.try_recv() {
+          Ok(stealer) => {
+            let steal = stealer.steal_batch_and_pop(&queue);
+            match steal {
+              Steal::Empty => {} // (*)
+              _ => {
+                // we are not done with this one yet
+                self.steal_all_sender.send(stealer).unwrap();
+
+                match steal {
+                  Steal::Success(task) => run_task!(task),
+                  Steal::Empty => {}
+                  Steal::Retry => unsafe { unreachable_unchecked() }, // (*)
+                }
               }
             }
           }
+          _ => {}
         }
-        _ => {}
-      }
-
-      for _ in 0..YIELDS {
-        thread::yield_now();
-        pop_global!();
-        steal_others!();
       }
 
       self.park();
@@ -183,4 +210,14 @@ impl Processor {
   pub fn steal_all(&self, s: Stealer<Task>) {
     self.steal_all_sender.send(s).unwrap();
   }
+}
+
+pub fn schedule_task(task: Task) {
+  QUEUE.with(|queue| match &*queue.borrow() {
+    // current thread is a processor
+    Some(queue) => queue.push(task),
+
+    // current thread is not a processor
+    None => SYSMON.push_task(task),
+  });
 }
