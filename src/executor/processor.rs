@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{bounded, Receiver, Sender};
 use crossbeam_deque::{Steal, Stealer, Worker};
 
 use crate::thread_pool;
@@ -71,7 +71,7 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 impl Processor {
   pub fn new(is_parking: &'static AtomicBool, last_seen: &'static AtomicU64) -> Arc<Processor> {
     let worker = Worker::new_fifo();
-    let (s, r) = unbounded();
+    let (s, r) = bounded(1);
     let processor = Arc::new(Processor {
       id: COUNTER.fetch_add(1, Ordering::Relaxed),
       valid: AtomicBool::new(true),
@@ -183,6 +183,8 @@ impl Processor {
       }
 
       self.park();
+
+      pop_global!();
     }
   }
 
