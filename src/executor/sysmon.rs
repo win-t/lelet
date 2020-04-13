@@ -1,6 +1,6 @@
 use std::hint::unreachable_unchecked;
 use std::mem::transmute;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -21,12 +21,16 @@ pub struct SysMon {
   // the global queue
   injector: Injector<Task>,
 
-  // this hint will used to wakeup idle processor
+  // this hint will used to wakeup parked processor
   injector_hint_sender: Sender<()>,
   injector_hint_reciever: Receiver<()>,
 
   // list of valid processor
   processors: Vec<Arc<Processor>>,
+
+  // "is_parking" and "last_seen" is stored in this vec,
+  // so it is packed and more cache friendly
+  processors_status_storage: Vec<(AtomicBool, AtomicU64)>,
 
   // this hint will used to determine which processor
   // to be stealed
@@ -37,14 +41,28 @@ pub static SYSMON: Lazy<SysMon> = Lazy::new(|| {
   let num_cpus = std::cmp::max(num_cpus::get(), 1);
   let (s, r) = bounded(num_cpus);
 
+  let mut processors_status_storage = Vec::new();
+  for _ in 0..num_cpus {
+    processors_status_storage.push((AtomicBool::new(false), AtomicU64::new(monotonic_ms())));
+  }
+
+  let mut processors = Vec::new();
+  for i in 0..num_cpus {
+    // this is safe, because processors_status_storage is
+    // intialized once and never get droped (basically it is static)
+    let is_parking_ref: &'static AtomicBool = unsafe { transmute(&processors_status_storage[i].0) };
+    let last_seen_ref: &'static AtomicU64 = unsafe { transmute(&processors_status_storage[i].1) };
+
+    processors.push(Processor::new(is_parking_ref, last_seen_ref));
+  }
+
   let sysmon = SysMon {
     injector: Injector::new(),
     injector_hint_sender: s,
     injector_hint_reciever: r,
 
-    processors: std::iter::repeat_with(|| Processor::new())
-      .take(num_cpus)
-      .collect(),
+    processors,
+    processors_status_storage,
 
     steal_index_hint: AtomicUsize::new(0),
   };
@@ -59,58 +77,41 @@ pub static SYSMON: Lazy<SysMon> = Lazy::new(|| {
 
 impl SysMon {
   fn main(&self) {
-    let mut delay = BLOCKING_THRESHOLD;
     loop {
-      thread::sleep(delay);
+      thread::sleep(BLOCKING_THRESHOLD);
 
       let now = monotonic_ms();
       let must_seen_at = now - BLOCKING_THRESHOLD.as_millis() as u64;
 
-      // find blocking processors, a processor is considered as blocking
-      // when they failed to update last_seen at least once per BLOCKING_THRESHOLD period
-      let mut replacement: Vec<_> = self
-        .processors
-        .iter()
-        .filter(|p| !p.is_parking() && p.get_last_seen() < must_seen_at)
-        .map(|p| p.clone())
-        .zip(std::iter::repeat_with(|| Processor::new()))
-        .collect();
-
-      // update processors list
-      for current in self.processors.iter().rev() {
-        if replacement.is_empty() {
-          break;
+      for i in 0..self.processors_status_storage.len() {
+        let (ref is_parking, ref last_seen) = self.processors_status_storage[i];
+        let is_parking: &AtomicBool = is_parking;
+        let last_seen: &AtomicU64 = last_seen;
+        if is_parking.load(Ordering::Relaxed) || must_seen_at <= last_seen.load(Ordering::Relaxed) {
+          continue;
         }
 
-        let (old, _) = &replacement[replacement.len() - 1];
-        if Arc::ptr_eq(current, &old) {
-          let (old, new) = replacement.pop().unwrap();
-          old.mark_invalid();
-          new.steal_all(old.get_stealer().clone());
+        let current: &Arc<Processor> = &self.processors[i];
+        current.mark_invalid();
 
-          // force swap on immutable processors list, atomic update the processor pointer
-          // inside the list, others will see some inconsistency in the list, but that is okay
-          unsafe {
-            let current = transmute::<&Arc<Processor>, &AtomicPtr<*mut Processor>>(current);
-            let new = transmute::<&Arc<Processor>, &AtomicPtr<*mut Processor>>(&new);
-            let old = current.swap(new.load(Ordering::SeqCst), Ordering::SeqCst);
-            new.store(old, Ordering::SeqCst);
-          }
+        // this is safe as long:
+        // 1. see SYSMON initialization
+        // 2. processor never access it after mark_invalid() is called
+        let is_parking_ref: &'static AtomicBool = unsafe { transmute(is_parking) };
+        let last_seen_ref: &'static AtomicU64 = unsafe { transmute(last_seen) };
+
+        let new: &Arc<Processor> = &Processor::new(is_parking_ref, last_seen_ref);
+        new.steal_all(current.get_stealer().clone());
+
+        // force swap on immutable processors list, atomic update the processor pointer
+        // inside the list, others will see some inconsistency in the list, but that is okay
+        unsafe {
+          let current = transmute::<&Arc<Processor>, &AtomicPtr<*mut Processor>>(current);
+          let new = transmute::<&Arc<Processor>, &AtomicPtr<*mut Processor>>(&new);
+          let old = current.swap(new.load(Ordering::SeqCst), Ordering::SeqCst);
+          new.store(old, Ordering::SeqCst);
         }
       }
-
-      delay = Duration::from_millis(
-        self
-          .processors
-          .iter()
-          .filter(|p| !p.is_parking())
-          .map(|p| p.get_last_seen())
-          .chain(std::iter::once(now))
-          .min()
-          .unwrap()
-          + BLOCKING_THRESHOLD.as_millis() as u64
-          - now,
-      );
     }
   }
 

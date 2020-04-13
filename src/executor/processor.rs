@@ -1,6 +1,8 @@
+use std::hint::unreachable_unchecked;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::thread;
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use crossbeam_deque::{Steal, Stealer, Worker};
@@ -15,31 +17,21 @@ use super::WORKER;
 
 pub struct Processor {
   valid: AtomicBool,
-  parked: AtomicBool,
-  last_seen: AtomicU64,
+  is_parking: &'static AtomicBool,
+  last_seen: &'static AtomicU64,
   stealer: Stealer<Task>,
   steal_all_sender: Sender<Stealer<Task>>,
   steal_all_receiver: Receiver<Stealer<Task>>,
 }
 
-macro_rules! run_task {
-  ($self:ident, $task:ident, $counter:ident) => {{
-    $task.run();
-    $counter += 1;
-    if !$self.still_valid() {
-      return;
-    }
-  }};
-}
-
 impl Processor {
-  pub fn new() -> Arc<Processor> {
+  pub fn new(is_parking: &'static AtomicBool, last_seen: &'static AtomicU64) -> Arc<Processor> {
     let worker = Worker::new_fifo();
     let (s, r) = unbounded();
     let processor = Arc::new(Processor {
       valid: AtomicBool::new(true),
-      parked: AtomicBool::new(false),
-      last_seen: AtomicU64::new(monotonic_ms()),
+      is_parking,
+      last_seen,
       stealer: worker.stealer(),
       steal_all_sender: s,
       steal_all_receiver: r,
@@ -69,53 +61,82 @@ impl Processor {
 
     // Number of runs in a row before the global queue is inspected.
     const MAX_RUNS: u64 = 64;
+
+    // Number of yields before parking the current thread
+    const YIELDS: u64 = 2;
+
     let mut counter: u64 = 0;
-    loop {
+    'main: loop {
+      macro_rules! run_task {
+        ($task:ident) => {{
+          $task.run();
+          counter += 1;
+          if !self.valid.load(Ordering::Relaxed) {
+            return;
+          }
+          continue 'main;
+        }};
+      }
+
+      macro_rules! pop_global {
+        () => {{
+          counter = 0;
+          match SYSMON.pop_task(&worker) {
+            Some(task) => run_task!(task),
+            None => {}
+          }
+        }};
+      }
+
+      macro_rules! steal_others {
+        () => {{
+          match SYSMON.steal_task(&worker) {
+            Some(task) => run_task!(task),
+            None => {}
+          }
+        }};
+      }
+
       self.tick();
 
-      if counter > MAX_RUNS {
-        counter = 0;
-        match SYSMON.pop_task(&worker) {
-          Some(task) => run_task!(self, task, counter),
-          None => {}
-        }
+      if counter >= MAX_RUNS {
+        pop_global!();
       }
 
       if let Some(task) = worker.pop() {
-        run_task!(self, task, counter);
-        continue;
+        run_task!(task);
       }
 
-      match SYSMON.pop_task(&worker) {
-        Some(task) => {
-          run_task!(self, task, counter);
-          continue;
-        }
-        None => {}
-      }
+      pop_global!();
+      steal_others!();
 
       match self.steal_all_receiver.try_recv() {
         Ok(stealer) => {
-          match stealer.steal_batch(&worker) {
-            Steal::Empty => {}
-            _ => self.steal_all_sender.send(stealer).unwrap(),
+          let steal = stealer.steal_batch_and_pop(&worker);
+          match steal {
+            Steal::Empty => {} // (*)
+            _ => {
+              // we are not done with this stealer yet
+              self.steal_all_sender.send(stealer).unwrap();
+
+              match steal {
+                Steal::Success(task) => run_task!(task),
+                Steal::Empty => {}
+                Steal::Retry => unsafe { unreachable_unchecked() }, // (*)
+              }
+            }
           }
-          continue;
         }
         _ => {}
       }
 
-      match SYSMON.steal_task(&worker) {
-        Some(task) => {
-          run_task!(self, task, counter);
-          continue;
-        }
-        None => {}
+      for _ in 0..YIELDS {
+        thread::yield_now();
+        pop_global!();
+        steal_others!();
       }
 
-      self.parked.store(true, Ordering::Relaxed);
-      SYSMON.park();
-      self.parked.store(false, Ordering::Relaxed);
+      self.park();
     }
   }
 
@@ -123,16 +144,13 @@ impl Processor {
     self.last_seen.store(monotonic_ms(), Ordering::Relaxed);
   }
 
-  pub fn is_parking(&self) -> bool {
-    self.parked.load(Ordering::Relaxed)
-  }
+  fn park(&self) {
+    self.is_parking.store(true, Ordering::Relaxed);
+    defer! {
+      self.is_parking.store(false, Ordering::Relaxed);
+    }
 
-  pub fn get_last_seen(&self) -> u64 {
-    self.last_seen.load(Ordering::Relaxed)
-  }
-
-  fn still_valid(&self) -> bool {
-    self.valid.load(Ordering::Relaxed)
+    SYSMON.park();
   }
 
   pub fn mark_invalid(&self) {

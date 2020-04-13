@@ -28,12 +28,9 @@ thread_local! {
 // if current thread have worker queue, schedule the task to it
 // otherwise schedule it to global queue
 fn schedule_task(task: Task) {
-  WORKER.with(|worker| {
-    let worker = worker.borrow();
-    match worker.as_ref() {
-      Some(worker) => worker.push(task),
-      None => SYSMON.push_task(task),
-    }
+  WORKER.with(|worker| match worker.borrow().as_ref() {
+    Some(worker) => worker.push(task),
+    None => SYSMON.push_task(task),
   });
 }
 
