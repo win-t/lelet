@@ -166,6 +166,10 @@ impl Executor {
     for index in 0..self.processors.len() {
       let p = &self.processors[index];
       assert_eq!(index, p.id);
+      assert_eq!(
+        p.machine_id.load(Ordering::Relaxed),
+        self.machines[index].id,
+      );
     }
 
     // to make sure all processor are ready
