@@ -1,7 +1,7 @@
 [package]
 name = "lelet"
 description = "golang like task executor"
-version = "1.0.10"
+version = "1.0.11"
 authors = ["Kurnia D Win <kurnia.d.win@gmail.com>"]
 edition = "2018"
 license = "GPL-3.0+"
@@ -21,3 +21,4 @@ async-task = "2.0.0"
 num_cpus = "1.12.0"
 lazy_static = "1.4.0"
 log = "0.4.8"
+crossbeam-utils = "0.7.2"

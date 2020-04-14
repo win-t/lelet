@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
+use crossbeam_utils::Backoff;
 use log::trace;
 use once_cell::sync::Lazy;
 
@@ -70,7 +71,7 @@ struct Machine {
   stealer: Stealer<Task>,
 
   // we inherit this from old machine when we replace them
-  old_machine_stealer: Stealer<Task>,
+  inherit: Stealer<Task>,
 }
 
 static EXECUTOR: Lazy<Executor> = Lazy::new(|| {
@@ -85,7 +86,7 @@ static EXECUTOR: Lazy<Executor> = Lazy::new(|| {
 
     processors.push(Processor {
       id,
-      machine_id: AtomicUsize::new(INVALID_ID),
+      machine_id: AtomicUsize::new(INVALID_ID), // will be filled by machine (*)
       last_seen: AtomicU64::new(0),
       sleeping: AtomicBool::new(true),
       injector: Injector::new(),
@@ -98,6 +99,7 @@ static EXECUTOR: Lazy<Executor> = Lazy::new(|| {
 
   let mut machines = Vec::with_capacity(num_cpus);
   for index in 0..num_cpus {
+    // take over the processor, replace its machine_id (*)
     machines.push(Machine::create_with_processor(
       &processors[index],
       empty_worker.stealer(),
@@ -136,13 +138,16 @@ impl std::fmt::Debug for TaskTag {
 
 impl Executor {
   fn sysmon_main(&self) {
-    for id in 0..self.processors.len() {
-      let p = &self.processors[id];
-      assert_eq!(id, p.id);
+    for index in 0..self.processors.len() {
+      let p = &self.processors[index];
+      assert_eq!(index, p.id);
     }
 
+    // to make sure all processor are ready
+    thread::sleep(BLOCKING_THRESHOLD);
+
     loop {
-      thread::sleep(BLOCKING_THRESHOLD);
+      thread::sleep(BLOCKING_THRESHOLD / 2);
 
       let must_seen_at = now_ms() - BLOCKING_THRESHOLD.as_millis() as u64;
 
@@ -163,14 +168,16 @@ impl Executor {
           new
         );
 
-        // force swap on immutable list, atomic update the pointer in the list
+        // force swap on immutable list, atomic update the Arc/pointer in the list
         // this is safe because:
         // 1) Arc have same size with *mut ()
-        // 2) Arc counter is not touched in the process, no drop and use-after-free
+        // 2) Arc counter is not touched when swaping
         unsafe {
           // #1
           if false {
-            // do not run this code, this is for compile time checking
+            // do not run this code, this is for compile time checking only
+            // transmute null_mut() to Arc will surely crashing the program
+            //
             // https://internals.rust-lang.org/t/compile-time-assert/6751/2
             transmute::<*mut (), Arc<Machine>>(std::ptr::null_mut());
           }
@@ -186,24 +193,24 @@ impl Executor {
   }
 
   fn push(&self, t: Task) {
-    let mut id = t.tag().schedule_hint.load(Ordering::Relaxed);
+    let mut index = t.tag().schedule_hint.load(Ordering::Relaxed);
 
     // if the task is not have prefered processor, we pick one
-    if id > self.processors.len() {
-      id = self.processor_push_index_hint.load(Ordering::Relaxed);
+    if index > self.processors.len() {
+      index = self.processor_push_index_hint.load(Ordering::Relaxed);
 
       // rotate the index, for fair load
       self
         .processor_push_index_hint
-        .store((id + 1) % self.processors.len(), Ordering::Relaxed);
+        .store((index + 1) % self.processors.len(), Ordering::Relaxed);
     }
 
-    self.processors[id].push(t);
+    self.processors[index].push(t);
   }
 
   fn pop(&self, index: usize, dest: &Worker<Task>) -> Option<Task> {
     // pop from global queue that dedicated to processor[index],
-    // if no task found, proceed to another global queue
+    // if None, proceed to another global queue
     let (l, r) = self.processors.split_at(index);
     r.iter()
       .chain(l.iter())
@@ -218,12 +225,12 @@ impl Executor {
     let (l, r) = self.machines.split_at(m);
     (1..)
       .zip(r.iter().chain(l.iter()))
-      .map(|(i, m)| {
+      .map(|(hint_add, m)| {
         (
-          i,
+          hint_add,
           // steal until success or empty
           std::iter::repeat_with(|| m.stealer.steal_batch_and_pop(dest))
-            .filter(|s| !matches!(s, Steal::Retry)) // (*)
+            .filter(|s| !matches!(s, Steal::Retry)) // not Steal::Retry (*)
             .map(|s| match s {
               Steal::Success(task) => Some(task),
               Steal::Empty => None,
@@ -235,10 +242,10 @@ impl Executor {
       })
       .filter(|(_, s)| matches!(s, Some(_)))
       .nth(0)
-      .map(|(i, s)| {
+      .map(|(hint_add, s)| {
         self
           .machine_steal_index_hint
-          .store((m + i) % self.machines.len(), Ordering::Relaxed);
+          .store((m + hint_add) % self.machines.len(), Ordering::Relaxed);
         s
       })
       .flatten()
@@ -250,15 +257,36 @@ impl Processor {
     self.sleeping.load(Ordering::Relaxed)
   }
 
+  fn set_sleeping(&self, b: bool) {
+    self.sleeping.store(b, Ordering::Relaxed)
+  }
+
   fn sleep(&self) {
-    trace!("{:?} entering sleep", self);
-    self.sleeping.store(true, Ordering::Relaxed);
+    self.set_sleeping(true);
     defer! {
-      trace!("{:?} leaving sleep", self);
-      self.sleeping.store(false, Ordering::Relaxed);
+      self.set_sleeping(false);
     }
 
-    self.wake_up_notif.recv().unwrap();
+    let backoff = Backoff::new();
+    loop {
+      match self.wake_up_notif.try_recv() {
+        Ok(()) => return,
+        Err(_) => {
+          if backoff.is_completed() {
+            {
+              trace!("{:?} entering sleep", self);
+              defer! {
+                trace!("{:?} leaving sleep", self);
+              }
+              self.wake_up_notif.recv().unwrap();
+            }
+            return;
+          } else {
+            backoff.snooze();
+          }
+        }
+      }
+    }
   }
 
   fn get_last_seen(&self) -> u64 {
@@ -277,7 +305,7 @@ impl Processor {
   fn pop(&self, dest: &Worker<Task>) -> Option<Task> {
     // steal until success or empty
     std::iter::repeat_with(|| self.injector.steal_batch_and_pop(dest))
-      .filter(|s| !matches!(s, Steal::Retry)) // (*)
+      .filter(|s| !matches!(s, Steal::Retry)) // not Steal::Retry (*)
       .map(|s| match s {
         Steal::Success(task) => Some(task),
         Steal::Empty => None,
@@ -295,7 +323,7 @@ impl std::fmt::Debug for Processor {
 }
 
 impl Machine {
-  fn create_with_processor(p: &Processor, old_machine_stealer: Stealer<Task>) -> Arc<Machine> {
+  fn create_with_processor(p: &Processor, inherit: Stealer<Task>) -> Arc<Machine> {
     let id = MACHINE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
 
     // take over the processor
@@ -306,13 +334,14 @@ impl Machine {
     let machine = Arc::new(Machine {
       id,
       stealer: stealer,
-      old_machine_stealer,
+      inherit,
     });
     {
       let machine = machine.clone();
 
-      // this is safe because processor is never get dropped after created
-      let processor = unsafe { transmute(p) };
+      // this is safe because processor is never get dropped after created,
+      // it can be assume that it have static lifetime
+      let processor: &'static Processor = unsafe { transmute(p) };
 
       thread_pool::spawn_box(Box::new(move || {
         abort_on_panic(move || machine.main(worker, processor))
@@ -325,23 +354,16 @@ impl Machine {
   fn main(&self, worker: Worker<Task>, processor: &Processor) {
     trace!("{:?} now is running on {:?}", processor, self);
 
-    // push remaining task to global queue before leaving
-    defer! {
-      while let Some(task) = worker.pop() {
-        processor.push(task);
-      }
-    }
+    processor.tick();
+    processor.set_sleeping(false);
 
     // Number of runs in a row before the global queue is inspected.
     const MAX_RUNS: u64 = 64;
 
-    // Number of yields before sleeping
-    const YIELDS: u64 = 2;
-
     let mut run_counter = 0;
 
-    // try to inherit initial task from old machine
-    let _ = self.old_machine_stealer.steal_batch(&worker);
+    // try steal initial task from old machine
+    let _ = self.inherit.steal_batch(&worker);
 
     'main: loop {
       macro_rules! run_task {
@@ -387,24 +409,24 @@ impl Machine {
         run_task!(task);
       }
 
-      match self.old_machine_stealer.steal_batch_and_pop(&worker) {
+      // at this point, worker is empty
+
+      // 1. steal from old machine
+      match self.inherit.steal_batch_and_pop(&worker) {
         Steal::Success(task) => run_task!(task),
         _ => {}
       }
 
-      for i in 0..YIELDS + 1 {
-        if i > 0 {
-          thread::yield_now();
-        }
+      // 2. pop from global queue
+      get_tasks!();
 
-        get_tasks!();
-
-        match EXECUTOR.steal(&worker) {
-          Some(task) => run_task!(task),
-          None => {}
-        }
+      // 3. steal from others
+      match EXECUTOR.steal(&worker) {
+        Some(task) => run_task!(task),
+        None => {}
       }
 
+      // 4. no more task for now, just sleep until waked up
       processor.sleep();
       get_tasks!();
     }
