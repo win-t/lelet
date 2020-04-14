@@ -46,6 +46,9 @@ struct Executor {
 
   // used to select which machine to be stealed first
   machine_steal_index_hint: AtomicUsize,
+
+  wake_up: Sender<()>,
+  wake_up_notif: Receiver<()>,
 }
 
 struct Processor {
@@ -56,12 +59,10 @@ struct Processor {
 
   // for blocking detection
   last_seen: AtomicU64,
-  sleeping: AtomicBool,
+  pinned: AtomicBool,
 
   // global queue dedicated to this processor
   injector: Injector<Task>,
-  wake_up: Sender<()>,
-  wake_up_notif: Receiver<()>,
 }
 
 struct Machine {
@@ -80,19 +81,15 @@ static EXECUTOR: Lazy<Executor> = Lazy::new(|| {
 
   let mut processors = Vec::with_capacity(num_cpus);
   for id in 0..num_cpus {
-    // channel with buffer size 1 is enough to give notification
-    // when new task is arrive
-    let (wake_up, wake_up_notif) = bounded(1);
-
-    processors.push(Processor {
+    let p = Processor {
       id,
       machine_id: AtomicUsize::new(INVALID_ID), // will be filled by machine (*)
       last_seen: AtomicU64::new(0),
-      sleeping: AtomicBool::new(true),
+      pinned: AtomicBool::new(true),
       injector: Injector::new(),
-      wake_up,
-      wake_up_notif,
-    });
+    };
+    trace!("{:?} is created", p);
+    processors.push(p);
   }
 
   let empty_worker = Worker::new_fifo();
@@ -108,12 +105,19 @@ static EXECUTOR: Lazy<Executor> = Lazy::new(|| {
 
   thread::spawn(move || abort_on_panic(move || EXECUTOR.sysmon_main()));
 
+  // channel with buffer size 1 is enough to give notification
+  // when new task is arrive
+  let (wake_up, wake_up_notif) = bounded(1);
+
   Executor {
     processors,
     processor_push_index_hint: AtomicUsize::new(0),
 
     machines,
     machine_steal_index_hint: AtomicUsize::new(0),
+
+    wake_up,
+    wake_up_notif,
   }
 });
 
@@ -123,16 +127,22 @@ static MACHINE_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 impl TaskTag {
   fn new() -> TaskTag {
-    TaskTag {
+    let tag = TaskTag {
       id: TASK_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
       schedule_hint: AtomicUsize::new(INVALID_ID),
-    }
+    };
+    trace!("{} is created", TaskTag::string_rep(tag.id));
+    tag
+  }
+
+  fn string_rep(id: usize) -> String {
+    format!("T({})", id)
   }
 }
 
-impl std::fmt::Debug for TaskTag {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.write_str(&format!("T({})", self.id))
+impl Drop for TaskTag {
+  fn drop(&mut self) {
+    trace!("{} is destroyed", TaskTag::string_rep(self.id));
   }
 }
 
@@ -154,7 +164,7 @@ impl Executor {
       for index in 0..self.processors.len() {
         let p = &self.processors[index];
 
-        if p.is_sleeping() || must_seen_at <= p.get_last_seen() {
+        if p.is_pinned() || must_seen_at <= p.get_last_seen() {
           continue;
         }
 
@@ -162,7 +172,7 @@ impl Executor {
         let new: &Arc<Machine> = &Machine::create_with_processor(p, current.stealer.clone());
 
         trace!(
-          "{:?} is not responding while on {:?}, replacing with {:?}",
+          "{:?} is not responding while running on {:?}, replacing with {:?}",
           p,
           current,
           new
@@ -253,23 +263,23 @@ impl Executor {
 }
 
 impl Processor {
-  fn is_sleeping(&self) -> bool {
-    self.sleeping.load(Ordering::Relaxed)
+  fn is_pinned(&self) -> bool {
+    self.pinned.load(Ordering::Relaxed)
   }
 
-  fn set_sleeping(&self, b: bool) {
-    self.sleeping.store(b, Ordering::Relaxed)
+  fn set_pinned(&self, b: bool) {
+    self.pinned.store(b, Ordering::Relaxed)
   }
 
   fn sleep(&self) {
-    self.set_sleeping(true);
+    self.set_pinned(true);
     defer! {
-      self.set_sleeping(false);
+      self.set_pinned(false);
     }
 
     let backoff = Backoff::new();
     loop {
-      match self.wake_up_notif.try_recv() {
+      match EXECUTOR.wake_up_notif.try_recv() {
         Ok(()) => return,
         Err(_) => {
           if backoff.is_completed() {
@@ -278,7 +288,7 @@ impl Processor {
               defer! {
                 trace!("{:?} leaving sleep", self);
               }
-              self.wake_up_notif.recv().unwrap();
+              EXECUTOR.wake_up_notif.recv().unwrap();
             }
             return;
           } else {
@@ -299,7 +309,11 @@ impl Processor {
 
   fn push(&self, t: Task) {
     self.injector.push(t);
-    let _ = self.wake_up.try_send(());
+
+    // wake up all processor,
+    // in case current processor is busy,
+    // others need to run (steal) it
+    let _ = EXECUTOR.wake_up.try_send(());
   }
 
   fn pop(&self, dest: &Worker<Task>) -> Option<Task> {
@@ -336,6 +350,9 @@ impl Machine {
       stealer: stealer,
       inherit,
     });
+
+    trace!("{:?} is created", machine);
+
     {
       let machine = machine.clone();
 
@@ -347,23 +364,29 @@ impl Machine {
         abort_on_panic(move || machine.main(worker, processor))
       }));
     }
-
     machine
   }
 
   fn main(&self, worker: Worker<Task>, processor: &Processor) {
-    trace!("{:?} now is running on {:?}", processor, self);
+    trace!("{:?} is running on {:?}", processor, self);
 
     processor.tick();
-    processor.set_sleeping(false);
+    processor.set_pinned(true);
+
+    // initial task from old machine
+    loop {
+      match self.inherit.steal_batch(&worker) {
+        Steal::Retry => continue,
+        _ => break,
+      }
+    }
+
+    processor.set_pinned(false);
 
     // Number of runs in a row before the global queue is inspected.
     const MAX_RUNS: u64 = 64;
 
     let mut run_counter = 0;
-
-    // try steal initial task from old machine
-    let _ = self.inherit.steal_batch(&worker);
 
     'main: loop {
       macro_rules! run_task {
@@ -374,13 +397,25 @@ impl Machine {
             .schedule_hint
             .store(processor.id, Ordering::Relaxed);
 
-          trace!("{:?} is running on {:?}", $task.tag(), processor);
+          let task_id = $task.tag().id;
+
+          trace!(
+            "{} is running on {:?}",
+            TaskTag::string_rep(task_id),
+            processor
+          );
+          processor.tick();
           $task.run();
 
           // if this machine don't hold the processor anymore
           // sysmon detect this machine was blocking and already replaced it with another machine
           if processor.machine_id.load(Ordering::Relaxed) != self.id {
-            trace!("{:?} is no longer holding {:?}", self, processor);
+            trace!(
+              "{:?} is no longer holding {:?}, blocking when executing {}",
+              self,
+              processor,
+              TaskTag::string_rep(task_id),
+            );
             return;
           }
 
@@ -399,19 +434,18 @@ impl Machine {
         }};
       }
 
-      processor.tick();
-
       if run_counter > MAX_RUNS {
         get_tasks!();
       }
 
+      // run all task in the worker
       if let Some(task) = worker.pop() {
         run_task!(task);
       }
 
-      // at this point, worker is empty
+      // at this point, the worker is empty
 
-      // 1. steal from old machine
+      // 1. steal from old machine (in case some one accidentally push to it)
       match self.inherit.steal_batch_and_pop(&worker) {
         Steal::Success(task) => run_task!(task),
         _ => {}
@@ -426,8 +460,10 @@ impl Machine {
         None => {}
       }
 
-      // 4. no more task for now, just sleep until waked up
+      // 4.a. no more task for now, just sleep until waked up
       processor.sleep();
+
+      // 4.b. just waked up, pop from global queue
       get_tasks!();
     }
   }
@@ -450,8 +486,6 @@ impl Drop for Machine {
 /// It's okay to do blocking operation in the task, the executor will detect
 /// this and scale the pool.
 pub fn spawn<F: Future<Output = ()> + Send + 'static>(f: F) {
-  let tag = TaskTag::new();
-  trace!("{:?} is created", tag);
-  let (task, _) = async_task::spawn(f, |t| EXECUTOR.push(t), tag);
+  let (task, _) = async_task::spawn(f, |t| EXECUTOR.push(t), TaskTag::new());
   task.schedule();
 }
