@@ -1,7 +1,7 @@
 [package]
 name = "lelet"
 description = "golang like task executor"
-version = "1.0.13"
+version = "1.0.14"
 authors = ["Kurnia D Win <kurnia.d.win@gmail.com>"]
 edition = "2018"
 license = "GPL-3.0+"
@@ -9,16 +9,33 @@ license = "GPL-3.0+"
 repository = "https://github.com/win-t/lelet"
 homepage = "https://github.com/win-t/lelet"
 documentation = "https://docs.rs/lelet"
+readme = "README.md"
 
-keywords = ["futures", "task", "executor", "spawn", "golang"]
-categories = ["asynchronous", "concurrency"]
+keywords = [
+  "futures",
+  "task",
+  "executor",
+  "golang",
+  "async",
+]
+
+categories = [
+  "asynchronous",
+  "concurrency",
+]
+
+[features]
+default = []
+
+# for debugging, will `trace!()` important event in the executor
+tracing = ["log"]
 
 [dependencies]
-once_cell = "1.3.1"
+async-task = "2.1.1"
 crossbeam-channel = "0.4.2"
 crossbeam-deque = "0.7.3"
-async-task = "2.1.0"
-num_cpus = "1.12.0"
-lazy_static = "1.4.0"
-log = "0.4.8"
 crossbeam-utils = "0.7.2"
+lazy_static = "1.4.0"
+log = { version = "0.4.8", optional = true }
+num_cpus = "1.12.0"
+once_cell = "1.3.1"

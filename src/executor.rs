@@ -14,8 +14,10 @@ use std::time::Duration;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use crossbeam_utils::Backoff;
-use log::trace;
 use once_cell::sync::Lazy;
+
+#[cfg(feature = "tracing")]
+use log::trace;
 
 use crate::thread_pool;
 use crate::utils::abort_on_panic;
@@ -27,7 +29,9 @@ const BLOCKING_THRESHOLD: Duration = Duration::from_millis(100);
 const INVALID_ID: usize = usize::MAX;
 
 struct TaskTag {
+  #[cfg(feature = "tracing")]
   id: usize,
+
   schedule_hint: AtomicUsize,
 }
 
@@ -88,7 +92,10 @@ static EXECUTOR: Lazy<Executor> = Lazy::new(|| {
       pinned: AtomicBool::new(true),
       injector: Injector::new(),
     };
+
+    #[cfg(feature = "tracing")]
     trace!("{:?} is created", p);
+
     processors.push(p);
   }
 
@@ -121,6 +128,7 @@ static EXECUTOR: Lazy<Executor> = Lazy::new(|| {
   }
 });
 
+#[cfg(feature = "tracing")]
 static TASK_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 static MACHINE_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -128,18 +136,25 @@ static MACHINE_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 impl TaskTag {
   fn new() -> TaskTag {
     let tag = TaskTag {
+      #[cfg(feature = "tracing")]
       id: TASK_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+
       schedule_hint: AtomicUsize::new(INVALID_ID),
     };
+
+    #[cfg(feature = "tracing")]
     trace!("{} is created", TaskTag::string_rep(tag.id));
+
     tag
   }
 
+  #[cfg(feature = "tracing")]
   fn string_rep(id: usize) -> String {
     format!("T({})", id)
   }
 }
 
+#[cfg(feature = "tracing")]
 impl Drop for TaskTag {
   fn drop(&mut self) {
     trace!("{} is destroyed", TaskTag::string_rep(self.id));
@@ -171,6 +186,7 @@ impl Executor {
         let current: &Arc<Machine> = &self.machines[index];
         let new: &Arc<Machine> = &Machine::create_with_processor(p, current.stealer.clone());
 
+        #[cfg(feature = "tracing")]
         trace!(
           "{:?} is not responding while running on {:?}, replacing with {:?}",
           p,
@@ -284,10 +300,14 @@ impl Processor {
         Err(_) => {
           if backoff.is_completed() {
             {
+              #[cfg(feature = "tracing")]
               trace!("{:?} entering sleep", self);
+
+              #[cfg(feature = "tracing")]
               defer! {
                 trace!("{:?} leaving sleep", self);
               }
+
               EXECUTOR.wake_up_notif.recv().unwrap();
             }
             return;
@@ -351,6 +371,7 @@ impl Machine {
       inherit,
     });
 
+    #[cfg(feature = "tracing")]
     trace!("{:?} is created", machine);
 
     {
@@ -368,6 +389,7 @@ impl Machine {
   }
 
   fn main(&self, worker: Worker<Task>, processor: &Processor) {
+    #[cfg(feature = "tracing")]
     trace!("{:?} is running on {:?}", processor, self);
 
     processor.tick();
@@ -397,25 +419,30 @@ impl Machine {
             .schedule_hint
             .store(processor.id, Ordering::Relaxed);
 
+          #[cfg(feature = "tracing")]
           let task_id = $task.tag().id;
 
+          #[cfg(feature = "tracing")]
           trace!(
             "{} is running on {:?}",
             TaskTag::string_rep(task_id),
             processor
           );
+
           processor.tick();
           $task.run();
 
           // if this machine don't hold the processor anymore
           // sysmon detect this machine was blocking and already replaced it with another machine
           if processor.machine_id.load(Ordering::Relaxed) != self.id {
+            #[cfg(feature = "tracing")]
             trace!(
               "{:?} is no longer holding {:?}, blocking when executing {}",
               self,
               processor,
               TaskTag::string_rep(task_id),
             );
+
             return;
           }
 
@@ -475,6 +502,7 @@ impl std::fmt::Debug for Machine {
   }
 }
 
+#[cfg(feature = "tracing")]
 impl Drop for Machine {
   fn drop(&mut self) {
     trace!("{:?} is destroyed", self);
