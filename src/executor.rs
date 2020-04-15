@@ -21,12 +21,14 @@ use log::trace;
 
 use crate::thread_pool;
 use crate::utils::abort_on_panic;
-use crate::utils::monotonic_ms as now_ms;
+use crate::utils::monotonic_ms;
 
 // how long a processor considered to be blocking
-const BLOCKING_THRESHOLD: Duration = Duration::from_millis(100);
+const BLOCKING_THRESHOLD: Duration = Duration::from_millis(10);
 
-const INVALID_ID: usize = usize::MAX;
+// interval of sysmon check, it is okay to be higher than BLOCKING_THRESHOLD
+// because idle processor will assist the sysmon
+const SYSMON_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
 struct TaskTag {
   #[cfg(feature = "tracing")]
@@ -51,8 +53,13 @@ struct Executor {
   // used to select which machine to be stealed first
   machine_steal_index_hint: AtomicUsize,
 
+  // to wakeup sleeping processor
   wake_up: Sender<()>,
   wake_up_notif: Receiver<()>,
+
+  // for sysmon assist
+  check_running: AtomicBool,
+  check_next: AtomicU64,
 }
 
 struct Processor {
@@ -63,7 +70,6 @@ struct Processor {
 
   // for blocking detection
   last_seen: AtomicU64,
-  pinned: AtomicBool,
 
   // global queue dedicated to this processor
   injector: Injector<Task>,
@@ -87,9 +93,8 @@ static EXECUTOR: Lazy<Executor> = Lazy::new(|| {
   for id in 0..num_cpus {
     let p = Processor {
       id,
-      machine_id: AtomicUsize::new(INVALID_ID), // will be filled by machine (*)
+      machine_id: AtomicUsize::new(0),
       last_seen: AtomicU64::new(0),
-      pinned: AtomicBool::new(true),
       injector: Injector::new(),
     };
 
@@ -100,14 +105,20 @@ static EXECUTOR: Lazy<Executor> = Lazy::new(|| {
   }
 
   let empty_worker = Worker::new_fifo();
-
   let mut machines = Vec::with_capacity(num_cpus);
   for index in 0..num_cpus {
-    // take over the processor, replace its machine_id (*)
-    machines.push(Machine::create_with_processor(
+    machines.push(Machine::move_processor_to_new_machine(
       &processors[index],
       empty_worker.stealer(),
     ));
+  }
+
+  // just to make sure,
+  // that index between processor and machine is consistent
+  for index in 0..processors.len() {
+    let p = &processors[index];
+    assert_eq!(index, p.id);
+    assert_eq!(p.machine_id.load(Ordering::Relaxed), machines[index].id,);
   }
 
   thread::spawn(move || abort_on_panic(move || EXECUTOR.sysmon_main()));
@@ -125,6 +136,9 @@ static EXECUTOR: Lazy<Executor> = Lazy::new(|| {
 
     wake_up,
     wake_up_notif,
+
+    check_running: AtomicBool::new(false),
+    check_next: AtomicU64::new(0),
   }
 });
 
@@ -139,7 +153,7 @@ impl TaskTag {
       #[cfg(feature = "tracing")]
       id: TASK_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
 
-      schedule_hint: AtomicUsize::new(INVALID_ID),
+      schedule_hint: AtomicUsize::new(usize::MAX),
     };
 
     #[cfg(feature = "tracing")]
@@ -162,64 +176,97 @@ impl Drop for TaskTag {
 }
 
 impl Executor {
-  fn sysmon_main(&self) {
+  fn sysmon_check(&self) {
+    let monotonic_ms = monotonic_ms();
+
+    if monotonic_ms < self.check_next.load(Ordering::Relaxed) {
+      // it is not time yet
+      return;
+    }
+
+    if self
+      .check_running
+      .compare_and_swap(false, true, Ordering::Relaxed)
+      == true
+    {
+      // check already running on other thread
+      // only one check allowed at a time
+      return;
+    }
+
+    defer! {
+      self.check_running.store(false, Ordering::Relaxed)
+    }
+
+    if monotonic_ms < BLOCKING_THRESHOLD.as_millis() as u64 {
+      return;
+    }
+
+    let must_seen_at = monotonic_ms - BLOCKING_THRESHOLD.as_millis() as u64;
+
     for index in 0..self.processors.len() {
       let p = &self.processors[index];
-      assert_eq!(index, p.id);
-      assert_eq!(
-        p.machine_id.load(Ordering::Relaxed),
-        self.machines[index].id,
+
+      if must_seen_at <= p.get_last_seen() {
+        continue;
+      }
+
+      let current: &Arc<Machine> = &self.machines[index];
+      let new: &Arc<Machine> = &Machine::move_processor_to_new_machine(p, current.stealer.clone());
+
+      #[cfg(feature = "tracing")]
+      trace!(
+        "{:?} is blocking while running on {:?}, replacing with {:?}",
+        p,
+        current,
+        new
       );
-    }
 
-    // to make sure all processor are ready
-    thread::sleep(BLOCKING_THRESHOLD);
-
-    loop {
-      thread::sleep(BLOCKING_THRESHOLD / 2);
-
-      let must_seen_at = now_ms() - BLOCKING_THRESHOLD.as_millis() as u64;
-
-      for index in 0..self.processors.len() {
-        let p = &self.processors[index];
-
-        if p.is_pinned() || must_seen_at <= p.get_last_seen() {
-          continue;
+      // force swap on immutable list, atomic update the Arc/pointer in the list
+      // this is safe because:
+      // 1) Arc have same size with *mut ()
+      // 2) Arc counter is not touched when swaping
+      // 3) only one thread is doing this (guarded by self.check_running)
+      unsafe {
+        // #1
+        if false {
+          // do not run this code, this is for compile time checking only
+          // transmute null_mut() to Arc will surely crashing the program
+          //
+          // https://internals.rust-lang.org/t/compile-time-assert/6751/2
+          transmute::<*mut (), Arc<Machine>>(std::ptr::null_mut());
         }
 
-        let current: &Arc<Machine> = &self.machines[index];
-        let new: &Arc<Machine> = &Machine::create_with_processor(p, current.stealer.clone());
-
-        #[cfg(feature = "tracing")]
-        trace!(
-          "{:?} is not responding while running on {:?}, replacing with {:?}",
-          p,
-          current,
-          new
-        );
-
-        // force swap on immutable list, atomic update the Arc/pointer in the list
-        // this is safe because:
-        // 1) Arc have same size with *mut ()
-        // 2) Arc counter is not touched when swaping
-        unsafe {
-          // #1
-          if false {
-            // do not run this code, this is for compile time checking only
-            // transmute null_mut() to Arc will surely crashing the program
-            //
-            // https://internals.rust-lang.org/t/compile-time-assert/6751/2
-            transmute::<*mut (), Arc<Machine>>(std::ptr::null_mut());
-          }
-
-          // #2
-          let current = transmute::<&Arc<Machine>, &AtomicPtr<()>>(current);
-          let new = transmute::<&Arc<Machine>, &AtomicPtr<()>>(&new);
-          let old = current.swap(new.load(Ordering::SeqCst), Ordering::SeqCst);
-          new.store(old, Ordering::SeqCst);
-        }
+        // #2
+        let current = transmute::<&Arc<Machine>, &AtomicPtr<()>>(current);
+        let new = transmute::<&Arc<Machine>, &AtomicPtr<()>>(&new);
+        let old = current.swap(new.load(Ordering::Relaxed), Ordering::Relaxed);
+        new.store(old, Ordering::Relaxed);
       }
     }
+
+    self.check_next.store(
+      self
+        .processors
+        .iter()
+        .map(|p| p.get_last_seen())
+        .chain(std::iter::once(monotonic_ms))
+        .min()
+        .unwrap()
+        + BLOCKING_THRESHOLD.as_millis() as u64,
+      Ordering::Relaxed,
+    );
+  }
+
+  fn sysmon_main(&self) {
+    loop {
+      thread::sleep(SYSMON_CHECK_INTERVAL);
+      self.sysmon_check();
+    }
+  }
+
+  fn sysmon_assist(&self) {
+    self.sysmon_check();
   }
 
   fn push(&self, t: Task) {
@@ -283,37 +330,22 @@ impl Executor {
 }
 
 impl Processor {
-  fn is_pinned(&self) -> bool {
-    self.pinned.load(Ordering::Relaxed)
-  }
-
-  fn set_pinned(&self, b: bool) {
-    self.pinned.store(b, Ordering::Relaxed)
-  }
-
   fn sleep(&self) {
-    self.set_pinned(true);
-    defer! {
-      self.set_pinned(false);
-    }
-
     let backoff = Backoff::new();
     loop {
       match EXECUTOR.wake_up_notif.try_recv() {
         Ok(()) => return,
         Err(_) => {
           if backoff.is_completed() {
-            {
-              #[cfg(feature = "tracing")]
-              trace!("{:?} entering sleep", self);
+            #[cfg(feature = "tracing")]
+            trace!("{:?} entering sleep", self);
 
-              #[cfg(feature = "tracing")]
-              defer! {
-                trace!("{:?} leaving sleep", self);
-              }
-
-              EXECUTOR.wake_up_notif.recv().unwrap();
+            #[cfg(feature = "tracing")]
+            defer! {
+              trace!("{:?} leaving sleep", self);
             }
+
+            EXECUTOR.wake_up_notif.recv().unwrap();
             return;
           } else {
             backoff.snooze();
@@ -323,12 +355,16 @@ impl Processor {
     }
   }
 
-  fn get_last_seen(&self) -> u64 {
-    self.last_seen.load(Ordering::Relaxed)
+  fn mark_blocking(&self) {
+    self.last_seen.store(monotonic_ms(), Ordering::Relaxed);
   }
 
-  fn tick(&self) {
-    self.last_seen.store(now_ms(), Ordering::Relaxed);
+  fn mark_nonblocking(&self) {
+    self.last_seen.store(u64::MAX, Ordering::Relaxed);
+  }
+
+  fn get_last_seen(&self) -> u64 {
+    self.last_seen.load(Ordering::Relaxed)
   }
 
   fn push(&self, t: Task) {
@@ -361,11 +397,12 @@ impl std::fmt::Debug for Processor {
 }
 
 impl Machine {
-  fn create_with_processor(p: &Processor, inherit: Stealer<Task>) -> Arc<Machine> {
+  fn move_processor_to_new_machine(p: &Processor, inherit: Stealer<Task>) -> Arc<Machine> {
     let id = MACHINE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
 
     // take over the processor
     p.machine_id.store(id, Ordering::Relaxed);
+    p.mark_nonblocking();
 
     let worker = Worker::new_fifo();
     let stealer = worker.stealer();
@@ -397,9 +434,6 @@ impl Machine {
     #[cfg(feature = "tracing")]
     trace!("{:?} is running on {:?}", processor, self);
 
-    processor.tick();
-    processor.set_pinned(true);
-
     // initial task from old machine
     loop {
       match self.inherit.steal_batch(&worker) {
@@ -407,8 +441,6 @@ impl Machine {
         _ => break,
       }
     }
-
-    processor.set_pinned(false);
 
     // Number of runs in a row before the global queue is inspected.
     const MAX_RUNS: u64 = 64;
@@ -434,22 +466,28 @@ impl Machine {
             processor
           );
 
-          processor.tick();
-          $task.run();
+          // help sysmon before doing real task
+          EXECUTOR.sysmon_assist();
 
-          // if this machine don't hold the processor anymore
-          // sysmon detect this machine was blocking and already replaced it with another machine
-          if processor.machine_id.load(Ordering::Relaxed) != self.id {
-            #[cfg(feature = "tracing")]
-            trace!(
-              "{:?} is no longer holding {:?}, blocking when executing {}",
-              self,
-              processor,
-              TaskTag::string_rep(task_id),
-            );
+          // always assume the task is blocking
+          processor.mark_blocking();
+          {
+            $task.run();
 
-            return;
+            // it is very crucial that we must exit this machine now when other machine holding
+            // the processor, so we don't mess up with the processor state
+            if processor.machine_id.load(Ordering::Relaxed) != self.id {
+              #[cfg(feature = "tracing")]
+              trace!(
+                "{:?} is no longer holding {:?}, blocking when executing {}",
+                self,
+                processor,
+                TaskTag::string_rep(task_id),
+              );
+              return;
+            }
           }
+          processor.mark_nonblocking();
 
           run_counter += 1;
           continue 'main;
