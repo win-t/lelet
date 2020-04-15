@@ -1,10 +1,12 @@
-use std::hint::unreachable_unchecked;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use once_cell::sync::Lazy;
+
+#[cfg(feature = "tracing")]
+use log::trace;
 
 use crate::utils::monotonic_ms;
 
@@ -35,16 +37,23 @@ impl Pool {
         thread::spawn(move || thread_main(receiver));
         self.sender.send(job).unwrap();
       }
-      // will never disconnected, because we holding reciever for cloning
-      TrySendError::Disconnected(_) => unsafe { unreachable_unchecked() },
+      TrySendError::Disconnected(_) => {}
     });
   }
 }
 
 fn thread_main(receiver: Receiver<Job>) {
+  #[cfg(feature = "tracing")]
+  trace!("A thread is started");
+
   loop {
     match receiver.recv_timeout(IDLE_THRESHOLD) {
-      Ok(job) => job(),
+      Ok(job) => {
+        #[cfg(feature = "tracing")]
+        trace!("A thread is cached for reused");
+
+        job();
+      }
       _ => {
         // only 1 thread is allowed to exit per IDLE_THRESHOLD
         let now = monotonic_ms();
@@ -55,6 +64,9 @@ fn thread_main(receiver: Receiver<Job>) {
             .compare_and_swap(last_exit, now, Ordering::Relaxed)
             == last_exit
           {
+            #[cfg(feature = "tracing")]
+            trace!("A thread is exiting");
+
             return;
           }
         }

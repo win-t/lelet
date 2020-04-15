@@ -1,7 +1,7 @@
 [package]
 name = "lelet"
 description = "golang like task executor"
-version = "1.0.15"
+version = "1.0.16"
 authors = ["Kurnia D Win <kurnia.d.win@gmail.com>"]
 edition = "2018"
 license = "GPL-3.0+"
@@ -39,3 +39,7 @@ lazy_static = "1.4.0"
 log = { version = "0.4.8", optional = true }
 num_cpus = "1.12.0"
 once_cell = "1.3.1"
+
+[dev-dependencies]
+futures-timer = "3.0.2"
+simple_logger = "1.6.0"
