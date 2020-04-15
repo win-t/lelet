@@ -225,7 +225,7 @@ impl Executor {
   fn push(&self, t: Task) {
     let mut index = t.tag().schedule_hint.load(Ordering::Relaxed);
 
-    // if the task is not have prefered processor, we pick one
+    // if the task does not have prefered processor, we pick one
     if index > self.processors.len() {
       index = self.processor_push_index_hint.load(Ordering::Relaxed);
 
@@ -382,13 +382,14 @@ impl Machine {
       let machine = machine.clone();
 
       // this is safe because processor is never get dropped after created,
-      // it can be assume that it have static lifetime
+      // it can be assume that it has static lifetime
       let processor: &'static Processor = unsafe { transmute(p) };
 
       thread_pool::spawn_box(Box::new(move || {
         abort_on_panic(move || machine.main(worker, processor))
       }));
     }
+
     machine
   }
 
