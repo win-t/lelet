@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use crossbeam_deque::{Injector, Steal, Worker};
@@ -51,15 +52,33 @@ impl Processor {
     processor
   }
 
-  pub fn run_on_machine(&'static self, machine: &Machine, worker: Worker<Task>) {
+  pub fn run_on_machine(
+    &'static self,
+    current_machine: &Machine,
+    worker: Worker<Task>,
+    old_machine: Option<Arc<Machine>>,
+  ) {
     #[cfg(feature = "tracing")]
-    trace!("{:?} is running on {:?}", self, machine);
+    crate::thread_pool::THREAD_ID.with(|tid| {
+      let prev = match old_machine.as_ref() {
+        None => "None".into(),
+        Some(machine) => format!("{:?}", machine),
+      };
+      trace!(
+        "{:?} is now running on {:?} (prev is {}) on {:?}",
+        self,
+        current_machine,
+        prev,
+        tid,
+      );
+    });
 
     // Number of runs in a row before the global queue is inspected.
     const MAX_RUNS: u64 = 64;
 
     let mut run_counter = 0;
 
+    let backoff = Backoff::new();
     'main: loop {
       macro_rules! run_task {
         ($task:ident) => {{
@@ -69,30 +88,37 @@ impl Processor {
           #[cfg(feature = "tracing")]
           let task_rep = format!("{:?}", $task.tag());
 
-          #[cfg(feature = "tracing")]
-          trace!("{} is running on {:?}", task_rep, self);
-
           // help sysmon before doing real task
-          SYSTEM.assist();
+          SYSTEM.sysmon_assist();
 
           // always assume the task is blocking
-          self.mark_blocking();
+          self.mark_blocking(current_machine);
           {
-            $task.run();
+            // there is possibility that (*) is skipped because of race condition
+            if self.still_on_machine(current_machine) {
+              #[cfg(feature = "tracing")]
+              trace!("{} is running on {:?}", task_rep, self);
+              $task.run();
+              #[cfg(feature = "tracing")]
+              trace!("{} is done running on {:?}", task_rep, self);
+            } else {
+              // push the thak back, it will be stealed later
+              worker.push($task);
+            }
 
-            // if the processor is assigned to another machine, just exit
-            if !self.still_on_machine(machine) {
+            // (*) if the processor is assigned to another machine, just exit
+            if !self.still_on_machine(current_machine) {
               #[cfg(feature = "tracing")]
               trace!(
-                "{:?} is no longer on {:?}, it was blocking on {}",
-                self,
-                machine,
+                "{} was blocking, so {:?} is no longer on {:?}",
                 task_rep,
+                self,
+                current_machine,
               );
               return;
             }
           }
-          self.mark_nonblocking();
+          self.mark_nonblocking(current_machine);
 
           run_counter += 1;
           continue 'main;
@@ -120,21 +146,73 @@ impl Processor {
 
       // at this point, the worker is empty
 
-      // 1. pop from global queue
+      // 1. steal from old machine
+      if let Some(old_machine) = old_machine.as_ref() {
+        'inner: loop {
+          match old_machine.stealer.steal_batch_and_pop(&worker) {
+            Steal::Success(task) => run_task!(task),
+            Steal::Empty => break 'inner,
+            Steal::Retry => {}
+          }
+        }
+      }
+
+      // 2. pop from global queue
       get_tasks!();
 
-      // 2. steal from others
+      // 3. steal from others
       match SYSTEM.steal(&worker) {
         Some(task) => run_task!(task),
         None => {}
       }
 
-      // 3.a. no more task for now, just sleep until waked up
-      self.sleep();
+      // 4.a. no more task for now, just sleep until waked up
+      {
+        match self.wake_up_notif.try_recv() {
+          Ok(()) => continue 'main,
+          Err(_) => {
+            if backoff.is_completed() {
+              #[cfg(feature = "tracing")]
+              trace!("{:?} entering sleep", self);
 
-      // 3.b. just waked up, pop from global queue
+              #[cfg(feature = "tracing")]
+              defer! {
+                trace!("{:?} leaving sleep", self);
+              }
+
+              self.wake_up_notif.recv().unwrap();
+              backoff.reset();
+              continue 'main;
+            } else {
+              backoff.snooze();
+            }
+          }
+        }
+      }
+
+      // 4.b. just waked up, pop from global queue
       get_tasks!();
     }
+  }
+
+  fn mark_blocking(&'static self, machine: &Machine) {
+    // only alive machine can alter last_seen value
+    if !self.still_on_machine(machine) {
+      return;
+    }
+    self.last_seen.store(monotonic_ms(), Ordering::Relaxed);
+  }
+
+  fn mark_nonblocking(&'static self, machine: &Machine) {
+    // only alive machine can alter last_seen value
+    if !self.still_on_machine(machine) {
+      return;
+    }
+    self.last_seen.store(u64::MAX, Ordering::Relaxed);
+  }
+
+  pub fn get_last_seen(&'static self) -> u64 {
+    self.last_seen.load(Ordering::Relaxed)
   }
 
   pub fn send_wake_up(&'static self) -> bool {
@@ -142,43 +220,6 @@ impl Processor {
       Ok(_) => true,
       Err(_) => false,
     }
-  }
-
-  fn sleep(&'static self) {
-    let backoff = Backoff::new();
-    loop {
-      match self.wake_up_notif.try_recv() {
-        Ok(()) => return,
-        Err(_) => {
-          if backoff.is_completed() {
-            #[cfg(feature = "tracing")]
-            trace!("{:?} entering sleep", self);
-
-            #[cfg(feature = "tracing")]
-            defer! {
-              trace!("{:?} leaving sleep", self);
-            }
-
-            self.wake_up_notif.recv().unwrap();
-            return;
-          } else {
-            backoff.snooze();
-          }
-        }
-      }
-    }
-  }
-
-  fn mark_blocking(&'static self) {
-    self.last_seen.store(monotonic_ms(), Ordering::Relaxed);
-  }
-
-  fn mark_nonblocking(&'static self) {
-    self.last_seen.store(u64::MAX, Ordering::Relaxed);
-  }
-
-  pub fn get_last_seen(&'static self) -> u64 {
-    self.last_seen.load(Ordering::Relaxed)
   }
 
   pub fn push(&'static self, t: Task) -> bool {
@@ -201,7 +242,9 @@ impl Processor {
 
   pub fn set_machine(&'static self, machine: &Machine) {
     self.machine_id.store(machine.id, Ordering::Relaxed);
-    self.mark_nonblocking();
+
+    // mark non blocking on fresh machine
+    self.mark_nonblocking(machine);
   }
 
   pub fn still_on_machine(&'static self, machine: &Machine) -> bool {
@@ -211,6 +254,6 @@ impl Processor {
 
 impl std::fmt::Debug for Processor {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.write_str(&format!("P({})", self.index))
+    f.write_str(&format!("Processor({})", self.index))
   }
 }

@@ -31,7 +31,7 @@ impl TaskTag {
   }
 
   pub fn set_schedule_index_hint(&self, index: usize) {
-    // for optimization because atomic write will flush cpu cache
+    // for optimization, load and check first, because atomic store will flush cpu cache
     if self.schedule_index_hint.load(Ordering::Relaxed) != index {
       self.schedule_index_hint.store(index, Ordering::Relaxed);
     }
@@ -41,7 +41,7 @@ impl TaskTag {
 #[cfg(feature = "tracing")]
 impl std::fmt::Debug for TaskTag {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.write_str(&format!("T({})", self.id))
+    f.write_str(&format!("Task({})", self.id))
   }
 }
 

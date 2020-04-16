@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use crossbeam_deque::{Steal, Stealer, Worker};
+use crossbeam_deque::{Stealer, Worker};
 
 #[cfg(feature = "tracing")]
 use log::trace;
@@ -23,7 +23,7 @@ pub struct Machine {
 static MACHINE_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 impl Machine {
-  fn new() -> (Machine, Worker<Task>) {
+  fn new() -> (Arc<Machine>, Worker<Task>) {
     let worker = Worker::new_fifo();
     let stealer = worker.stealer();
     let machine = Machine {
@@ -34,48 +34,42 @@ impl Machine {
     #[cfg(feature = "tracing")]
     trace!("{:?} is created", machine);
 
-    (machine, worker)
+    (Arc::new(machine), worker)
   }
 
   pub fn new_and_take_over_processor(
     p: &'static Processor,
-    old_stealer: Option<Stealer<Task>>,
+    old_machine: Option<Arc<Machine>>,
   ) -> Arc<Machine> {
     let (machine, worker) = Machine::new();
-    let machine = Arc::new(machine);
     {
       let machine = machine.clone();
 
       // set processor's machine now, so old machine don't hold this processor anymore
       p.set_machine(&machine);
 
-      // drain old machine worker
-      if let Some(old_stealer) = old_stealer {
-        loop {
-          match old_stealer.steal_batch(&worker) {
-            Steal::Empty => break,
-            _ => (),
-          }
-        }
-      }
-
       // spawn machine thread
       thread_pool::spawn_box(Box::new(move || {
-        abort_on_panic(move || machine.execute_processor(p, worker))
+        abort_on_panic(move || machine.execute_processor(p, worker, old_machine))
       }));
     }
 
     machine
   }
 
-  fn execute_processor(&self, p: &'static Processor, worker: Worker<Task>) {
-    p.run_on_machine(&self, worker);
+  fn execute_processor(
+    &self,
+    p: &'static Processor,
+    worker: Worker<Task>,
+    old_machine: Option<Arc<Machine>>,
+  ) {
+    p.run_on_machine(&self, worker, old_machine);
   }
 }
 
 impl std::fmt::Debug for Machine {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.write_str(&format!("M({})", self.id))
+    f.write_str(&format!("Machine({})", self.id))
   }
 }
 

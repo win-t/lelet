@@ -6,11 +6,34 @@ use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use once_cell::sync::Lazy;
 
 #[cfg(feature = "tracing")]
+use std::cell::Cell;
+#[cfg(feature = "tracing")]
+use std::sync::atomic::AtomicUsize;
+
+#[cfg(feature = "tracing")]
 use log::trace;
 
 use crate::utils::monotonic_ms;
 
 const IDLE_THRESHOLD: Duration = Duration::from_secs(60);
+
+#[cfg(feature = "tracing")]
+static THREAD_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(feature = "tracing")]
+pub struct ThreadID(Cell<usize>);
+
+#[cfg(feature = "tracing")]
+impl std::fmt::Debug for ThreadID {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.write_str(&format!("Thread({})", self.0.get()))
+  }
+}
+
+#[cfg(feature = "tracing")]
+thread_local! {
+  pub static THREAD_ID: ThreadID = ThreadID(Cell::new(usize::MAX));
+}
 
 type Job = Box<dyn FnOnce() + Send>;
 
@@ -44,15 +67,25 @@ impl Pool {
 
 fn thread_main(receiver: Receiver<Job>) {
   #[cfg(feature = "tracing")]
-  trace!("A thread is started");
+  THREAD_ID.with(|id| {
+    id.0.set(THREAD_ID_COUNTER.fetch_add(1, Ordering::Relaxed));
+    trace!("{:?} is created", id);
+  });
 
   loop {
     match receiver.recv_timeout(IDLE_THRESHOLD) {
       Ok(job) => {
         #[cfg(feature = "tracing")]
-        trace!("A thread is cached for reused");
+        THREAD_ID.with(|id| {
+          trace!("{:?} is running", id);
+        });
 
         job();
+
+        #[cfg(feature = "tracing")]
+        THREAD_ID.with(|id| {
+          trace!("{:?} is done and cached for reused", id);
+        });
       }
       _ => {
         // only 1 thread is allowed to exit per IDLE_THRESHOLD
@@ -65,7 +98,9 @@ fn thread_main(receiver: Receiver<Job>) {
             == last_exit
           {
             #[cfg(feature = "tracing")]
-            trace!("A thread is exiting");
+            THREAD_ID.with(|id| {
+              trace!("{:?} is exiting", id);
+            });
 
             return;
           }

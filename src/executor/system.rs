@@ -21,6 +21,8 @@ const BLOCKING_THRESHOLD: Duration = Duration::from_millis(10);
 
 // interval of sysmon check, it is okay to be higher than BLOCKING_THRESHOLD
 // because idle processor will assist the sysmon
+// but, worst case scenario, if all processor blocking at same time (unable to assist)
+// the blocking will be not longer than this, dedicated sysmon thread will do the checking
 const SYSMON_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
 // singleton: SYSTEM
@@ -90,6 +92,7 @@ pub static SYSTEM: Lazy<&'static System> = Lazy::new(|| {
       assert!(p.still_on_machine(&self_.machines[index]));
     }
 
+    // spawn dedicated sysmon thread
     thread::spawn(move || abort_on_panic(move || SYSTEM.sysmon()));
   }
 
@@ -100,7 +103,7 @@ pub static SYSTEM: Lazy<&'static System> = Lazy::new(|| {
 });
 
 impl System {
-  fn check(&'static self) {
+  fn sysmon_check(&'static self) {
     let monotonic_ms = monotonic_ms();
 
     if monotonic_ms < self.check_next.load(Ordering::Relaxed) {
@@ -132,7 +135,7 @@ impl System {
       }
 
       let current = &self.machines[index];
-      let new = &Machine::new_and_take_over_processor(p, Some(current.stealer.clone()));
+      let new = &Machine::new_and_take_over_processor(p, Some(current.clone()));
 
       #[cfg(feature = "tracing")]
       trace!(
@@ -144,8 +147,8 @@ impl System {
 
       // force swap on immutable list, atomic update the Arc/pointer in the list
       // this is safe because:
-      // 1) Arc have same size with *mut ()
-      // 2) Arc counter is not touched when swaping
+      // 1) Arc have same size with AtomicPtr
+      // 2) Arc counter is not touched when swaping, no clone, no drop
       // 3) only one thread is doing this (guarded by self.check_running)
       unsafe {
         // #1
@@ -154,14 +157,14 @@ impl System {
           // transmute null_mut() to Arc will surely crashing the program
           //
           // https://internals.rust-lang.org/t/compile-time-assert/6751/2
-          transmute::<*mut (), Arc<Machine>>(std::ptr::null_mut());
+          transmute::<AtomicPtr<()>, Arc<Machine>>(AtomicPtr::new(std::ptr::null_mut()));
         }
 
         // #2
         let current = transmute::<&Arc<Machine>, &AtomicPtr<()>>(current);
         let new = transmute::<&Arc<Machine>, &AtomicPtr<()>>(&new);
-        let old = current.swap(new.load(Ordering::Relaxed), Ordering::Relaxed);
-        new.store(old, Ordering::Relaxed);
+        let tmp = current.swap(new.load(Ordering::Relaxed), Ordering::Relaxed);
+        new.store(tmp, Ordering::Relaxed);
       }
     }
 
@@ -181,12 +184,12 @@ impl System {
   fn sysmon(&'static self) {
     loop {
       thread::sleep(SYSMON_CHECK_INTERVAL);
-      self.check();
+      self.sysmon_check();
     }
   }
 
-  pub fn assist(&'static self) {
-    self.check();
+  pub fn sysmon_assist(&'static self) {
+    self.sysmon_check();
   }
 
   pub fn push(&'static self, t: Task) {
@@ -250,6 +253,7 @@ impl System {
       .filter(|(_, s)| matches!(s, Some(_)))
       .nth(0)
       .map(|(hint_add, s)| {
+        // rotate the index
         self.machine_steal_index_hint.compare_and_swap(
           m,
           (m + hint_add) % self.num_cpus,
