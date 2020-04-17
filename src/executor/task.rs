@@ -26,10 +26,12 @@ impl TaskTag {
     tag
   }
 
+  #[inline]
   pub fn get_schedule_index_hint(&self) -> usize {
     self.schedule_index_hint.load(Ordering::Relaxed)
   }
 
+  #[inline]
   pub fn set_schedule_index_hint(&self, index: usize) {
     // for optimization, load and check first, because atomic store will flush cpu cache
     if self.schedule_index_hint.load(Ordering::Relaxed) != index {

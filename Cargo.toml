@@ -1,7 +1,7 @@
 [package]
 name = "lelet"
 description = "golang like task executor"
-version = "1.0.17"
+version = "1.0.18"
 authors = ["Kurnia D Win <kurnia.d.win@gmail.com>"]
 edition = "2018"
 license = "GPL-3.0+"

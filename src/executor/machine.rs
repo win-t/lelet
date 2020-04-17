@@ -12,6 +12,8 @@ use crate::utils::abort_on_panic;
 use super::processor::Processor;
 use super::Task;
 
+// Machine is the one who have thread
+// every machine have thier own local Worker queue
 pub struct Machine {
   pub id: usize,
 
@@ -42,6 +44,7 @@ impl Machine {
     old_machine: Option<Arc<Machine>>,
   ) -> Arc<Machine> {
     let (machine, worker) = Machine::new();
+
     {
       let machine = machine.clone();
 
@@ -59,7 +62,7 @@ impl Machine {
 
   fn execute_processor(
     &self,
-    p: &'static Processor,
+    p: &Processor,
     worker: Worker<Task>,
     old_machine: Option<Arc<Machine>>,
   ) {

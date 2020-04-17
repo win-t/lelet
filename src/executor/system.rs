@@ -21,8 +21,8 @@ const BLOCKING_THRESHOLD: Duration = Duration::from_millis(10);
 
 // interval of sysmon check, it is okay to be higher than BLOCKING_THRESHOLD
 // because idle processor will assist the sysmon
-// but, worst case scenario, if all processor blocking at same time (unable to assist)
-// the blocking will be not longer than this, dedicated sysmon thread will do the checking
+// but, worst case scenario, all processor are unable to assist (blocking on task or sleeping)
+// and if that happen, a processor can be blocking up to this value
 const SYSMON_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
 // singleton: SYSTEM
@@ -103,6 +103,7 @@ pub static SYSTEM: Lazy<&'static System> = Lazy::new(|| {
 });
 
 impl System {
+  #[inline]
   fn sysmon_check(&'static self) {
     let monotonic_ms = monotonic_ms();
 
@@ -188,11 +189,13 @@ impl System {
     }
   }
 
+  #[inline]
   pub fn sysmon_assist(&'static self) {
     self.sysmon_check();
   }
 
-  pub fn push(&'static self, t: Task) {
+  #[inline]
+  pub fn push(&self, t: Task) {
     let mut index = t.tag().get_schedule_index_hint();
 
     // if the task does not have prefered processor, we pick one
@@ -208,7 +211,8 @@ impl System {
     }
 
     if !self.processors[index].push(t) {
-      // processors[index] is busy, wake up others
+      // cannot send wake up signal to processors[index] (processor is busy),
+      // wake up others
       let (l, r) = self.processors.split_at(index + 1);
       r.iter()
         .chain(l.iter())
@@ -218,9 +222,10 @@ impl System {
     }
   }
 
-  pub fn pop(&'static self, index: usize, dest: &Worker<Task>) -> Option<Task> {
+  #[inline]
+  pub fn pop(&self, index: usize, dest: &Worker<Task>) -> Option<Task> {
     // pop from global queue that dedicated to processor[index],
-    // if None, proceed to another global queue
+    // if None, pop from others
     let (l, r) = self.processors.split_at(index);
     r.iter()
       .chain(l.iter())
@@ -230,7 +235,8 @@ impl System {
       .flatten()
   }
 
-  pub fn steal(&'static self, dest: &Worker<Task>) -> Option<Task> {
+  #[inline]
+  pub fn steal(&self, dest: &Worker<Task>) -> Option<Task> {
     let m = self.machine_steal_index_hint.load(Ordering::Relaxed);
     let (l, r) = self.machines.split_at(m);
     (1..)

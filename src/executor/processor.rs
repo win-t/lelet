@@ -14,6 +14,7 @@ use super::machine::Machine;
 use super::system::SYSTEM;
 use super::Task;
 
+// Processor is the one who run the task
 pub struct Processor {
   pub index: usize,
 
@@ -53,22 +54,21 @@ impl Processor {
   }
 
   pub fn run_on_machine(
-    &'static self,
+    &self,
     current_machine: &Machine,
     worker: Worker<Task>,
     old_machine: Option<Arc<Machine>>,
   ) {
     #[cfg(feature = "tracing")]
     crate::thread_pool::THREAD_ID.with(|tid| {
-      let prev = match old_machine.as_ref() {
-        None => "None".into(),
-        Some(machine) => format!("{:?}", machine),
-      };
       trace!(
-        "{:?} is now running on {:?} (prev is {}) on {:?}",
+        "{:?} is now running on {:?}{} on {:?}",
         self,
         current_machine,
-        prev,
+        match old_machine.as_ref() {
+          None => "".into(),
+          Some(machine) => format!(" (prev is {:?})", machine),
+        },
         tid,
       );
     });
@@ -88,10 +88,9 @@ impl Processor {
           #[cfg(feature = "tracing")]
           let task_rep = format!("{:?}", $task.tag());
 
-          // help sysmon before doing real task
+          // help sysmon before doing blocking task
           SYSTEM.sysmon_assist();
 
-          // always assume the task is blocking
           self.mark_blocking(current_machine);
           {
             // there is possibility that (*) is skipped because of race condition
@@ -128,6 +127,7 @@ impl Processor {
       macro_rules! get_tasks {
         () => {{
           run_counter = 0;
+          let _ = self.wake_up_notif.try_recv();
           match SYSTEM.pop(self.index, &worker) {
             Some(task) => run_task!(task),
             None => {}
@@ -135,7 +135,7 @@ impl Processor {
         }};
       }
 
-      if run_counter > MAX_RUNS {
+      if run_counter >= MAX_RUNS {
         get_tasks!();
       }
 
@@ -166,36 +166,29 @@ impl Processor {
         None => {}
       }
 
-      // 4.a. no more task for now, just sleep until waked up
-      {
-        match self.wake_up_notif.try_recv() {
-          Ok(()) => continue 'main,
-          Err(_) => {
-            if backoff.is_completed() {
-              #[cfg(feature = "tracing")]
-              trace!("{:?} entering sleep", self);
+      // 4.a. no more task for now, just sleep
+      if backoff.is_completed() {
+        #[cfg(feature = "tracing")]
+        trace!("{:?} entering sleep", self);
 
-              #[cfg(feature = "tracing")]
-              defer! {
-                trace!("{:?} leaving sleep", self);
-              }
-
-              self.wake_up_notif.recv().unwrap();
-              backoff.reset();
-              continue 'main;
-            } else {
-              backoff.snooze();
-            }
-          }
+        #[cfg(feature = "tracing")]
+        defer! {
+          trace!("{:?} leaving sleep", self);
         }
+
+        self.wake_up_notif.recv().unwrap();
+        backoff.reset();
+      } else {
+        backoff.snooze();
       }
 
-      // 4.b. just waked up, pop from global queue
+      // 4.b. after sleep, pop from global queue
       get_tasks!();
     }
   }
 
-  fn mark_blocking(&'static self, machine: &Machine) {
+  #[inline]
+  fn mark_blocking(&self, machine: &Machine) {
     // only alive machine can alter last_seen value
     if !self.still_on_machine(machine) {
       return;
@@ -203,7 +196,8 @@ impl Processor {
     self.last_seen.store(monotonic_ms(), Ordering::Relaxed);
   }
 
-  fn mark_nonblocking(&'static self, machine: &Machine) {
+  #[inline]
+  fn mark_nonblocking(&self, machine: &Machine) {
     // only alive machine can alter last_seen value
     if !self.still_on_machine(machine) {
       return;
@@ -211,23 +205,27 @@ impl Processor {
     self.last_seen.store(u64::MAX, Ordering::Relaxed);
   }
 
-  pub fn get_last_seen(&'static self) -> u64 {
+  #[inline]
+  pub fn get_last_seen(&self) -> u64 {
     self.last_seen.load(Ordering::Relaxed)
   }
 
-  pub fn send_wake_up(&'static self) -> bool {
+  #[inline]
+  pub fn send_wake_up(&self) -> bool {
     match self.wake_up.try_send(()) {
       Ok(_) => true,
       Err(_) => false,
     }
   }
 
-  pub fn push(&'static self, t: Task) -> bool {
+  #[inline]
+  pub fn push(&self, t: Task) -> bool {
     self.injector.push(t);
     self.send_wake_up()
   }
 
-  pub fn pop(&'static self, dest: &Worker<Task>) -> Option<Task> {
+  #[inline]
+  pub fn pop(&self, dest: &Worker<Task>) -> Option<Task> {
     // steal until success or empty
     std::iter::repeat_with(|| self.injector.steal_batch_and_pop(dest))
       .filter(|s| !matches!(s, Steal::Retry))
@@ -240,14 +238,16 @@ impl Processor {
       .unwrap()
   }
 
-  pub fn set_machine(&'static self, machine: &Machine) {
+  #[inline]
+  pub fn set_machine(&self, machine: &Machine) {
     self.machine_id.store(machine.id, Ordering::Relaxed);
 
     // mark non blocking on fresh machine
     self.mark_nonblocking(machine);
   }
 
-  pub fn still_on_machine(&'static self, machine: &Machine) -> bool {
+  #[inline]
+  pub fn still_on_machine(&self, machine: &Machine) -> bool {
     self.machine_id.load(Ordering::Relaxed) == machine.id
   }
 }
