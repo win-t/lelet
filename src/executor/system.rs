@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use crossbeam_deque::{Steal, Worker};
+use crossbeam_deque::Worker;
 use once_cell::sync::Lazy;
 
 #[cfg(feature = "tracing")]
@@ -93,7 +93,7 @@ pub static SYSTEM: Lazy<&'static System> = Lazy::new(|| {
     }
 
     // spawn dedicated sysmon thread
-    thread::spawn(move || abort_on_panic(move || SYSTEM.sysmon()));
+    thread::spawn(move || abort_on_panic(move || SYSTEM.sysmon_main()));
   }
 
   unsafe {
@@ -182,7 +182,8 @@ impl System {
     );
   }
 
-  fn sysmon(&'static self) {
+  #[inline]
+  fn sysmon_main(&'static self) {
     loop {
       thread::sleep(SYSMON_CHECK_INTERVAL);
       self.sysmon_check();
@@ -210,13 +211,13 @@ impl System {
       );
     }
 
-    if !self.processors[index].push(t) {
+    if !self.processors[index].push_then_wake_up(t) {
       // cannot send wake up signal to processors[index] (processor is busy),
       // wake up others
       let (l, r) = self.processors.split_at(index + 1);
       r.iter()
         .chain(l.iter())
-        .map(|p| p.send_wake_up())
+        .map(|p| p.wake_up())
         .filter(|r| *r)
         .nth(0);
     }
@@ -241,21 +242,7 @@ impl System {
     let (l, r) = self.machines.split_at(m);
     (1..)
       .zip(r.iter().chain(l.iter()))
-      .map(|(hint_add, m)| {
-        (
-          hint_add,
-          // steal until success or empty
-          std::iter::repeat_with(|| m.stealer.steal_batch_and_pop(dest))
-            .filter(|s| !matches!(s, Steal::Retry))
-            .map(|s| match s {
-              Steal::Success(task) => Some(task),
-              Steal::Empty => None,
-              Steal::Retry => None,
-            })
-            .nth(0)
-            .unwrap(),
-        )
-      })
+      .map(|(hint_add, m)| (hint_add, m.steal(dest)))
       .filter(|(_, s)| matches!(s, Some(_)))
       .nth(0)
       .map(|(hint_add, s)| {

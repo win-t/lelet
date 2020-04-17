@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use crossbeam_deque::{Stealer, Worker};
+use crossbeam_deque::{Steal, Stealer, Worker};
 
 #[cfg(feature = "tracing")]
 use log::trace;
@@ -19,7 +19,7 @@ pub struct Machine {
 
   // stealer for the machine, worker part is moved via closure,
   // because Worker is !Send+!Sync
-  pub stealer: Stealer<Task>,
+  stealer: Stealer<Task>,
 }
 
 static MACHINE_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -53,20 +53,25 @@ impl Machine {
 
       // spawn machine thread
       thread_pool::spawn_box(Box::new(move || {
-        abort_on_panic(move || machine.execute_processor(p, worker, old_machine))
+        abort_on_panic(move || p.run_on_machine(&machine, worker, old_machine))
       }));
     }
 
     machine
   }
 
-  fn execute_processor(
-    &self,
-    p: &Processor,
-    worker: Worker<Task>,
-    old_machine: Option<Arc<Machine>>,
-  ) {
-    p.run_on_machine(&self, worker, old_machine);
+  #[inline]
+  pub fn steal(&self, dest: &Worker<Task>) -> Option<Task> {
+    // steal until success or empty
+    std::iter::repeat_with(|| self.stealer.steal_batch_and_pop(dest))
+      .filter(|s| !matches!(s, Steal::Retry))
+      .map(|s| match s {
+        Steal::Success(task) => Some(task),
+        Steal::Empty => None,
+        Steal::Retry => None,
+      })
+      .nth(0)
+      .unwrap()
   }
 }
 
