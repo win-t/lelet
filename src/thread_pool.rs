@@ -60,7 +60,7 @@ impl Pool {
         thread::spawn(move || thread_main(receiver));
         self.sender.send(job).unwrap();
       }
-      TrySendError::Disconnected(_) => {}
+      TrySendError::Disconnected(_) => unreachable!(), // we hold both side of the channel
     });
   }
 }

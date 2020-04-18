@@ -90,7 +90,7 @@ impl Processor {
               worker.push($task);
             }
 
-            // (*) if the processor is assigned to another machine, just exit
+            // (*) if the processor is running in another machine, just exit
             if !self.still_on_machine(machine) {
               #[cfg(feature = "tracing")]
               trace!(
@@ -224,7 +224,7 @@ impl Processor {
       .map(|s| match s {
         Steal::Success(task) => Some(task),
         Steal::Empty => None,
-        Steal::Retry => None,
+        Steal::Retry => unreachable!(), // already filtered
       })
       .nth(0)
       .unwrap()

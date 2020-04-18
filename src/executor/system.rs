@@ -74,8 +74,7 @@ pub static SYSTEM: Lazy<&'static System> = Lazy::new(|| {
 
   fn init(self_: &'static mut System) {
     for index in 0..self_.num_cpus {
-      let p = Processor::new(index);
-      self_.processors.push(p);
+      self_.processors.push(Processor::new(index));
     }
 
     for index in 0..self_.num_cpus {
@@ -216,7 +215,7 @@ impl System {
     if !self.processors[index].push_then_wake_up(t) {
       // cannot send wake up signal to processors[index] (processor is busy),
       // wake up others
-      let (l, r) = self.processors.split_at(index + 1);
+      let (l, r) = self.processors.split_at((index + 1) % self.num_cpus);
       r.iter()
         .chain(l.iter())
         .map(|p| p.wake_up())

@@ -58,7 +58,7 @@ impl Machine {
         abort_on_panic(move || {
           // fill initial tasks
           if let Some(initial_task_from) = initial_task_from.as_ref() {
-            while !initial_task_from.stealer.is_empty() {
+            loop {
               match initial_task_from.stealer.steal_batch(&worker) {
                 Steal::Empty => break,
                 _ => {}
@@ -83,7 +83,7 @@ impl Machine {
       .map(|s| match s {
         Steal::Success(task) => Some(task),
         Steal::Empty => None,
-        Steal::Retry => None,
+        Steal::Retry => unreachable!(), // already filtered
       })
       .nth(0)
       .unwrap()
