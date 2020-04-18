@@ -62,6 +62,10 @@ impl Processor {
     let mut run_counter = 0;
 
     let backoff = Backoff::new();
+
+    #[cfg(feature = "tracing")]
+    let mut last_task_rep = String::new();
+
     'main: loop {
       macro_rules! run_task {
         ($task:ident) => {{
@@ -71,20 +75,22 @@ impl Processor {
           // update the tag, so this task will be push to this processor again
           $task.tag().set_schedule_index_hint(self.index);
 
-          #[cfg(feature = "tracing")]
-          let task_rep = format!("{:?}", $task.tag());
-
           self.mark_blocking(machine);
           {
             // there is possibility that (*) is skipped because of race condition
             if self.still_on_machine(machine) {
               #[cfg(feature = "tracing")]
-              trace!("{} is running on {:?}", task_rep, self);
+              {
+                last_task_rep = format!("{:?}", $task.tag());
+                trace!("{} is running on {:?}", last_task_rep, self);
+              }
 
               $task.run();
 
               #[cfg(feature = "tracing")]
-              trace!("{} is done running on {:?}", task_rep, self);
+              {
+                trace!("{} is done running on {:?}", last_task_rep, self);
+              }
             } else {
               // put it back in
               worker.push($task);
@@ -95,7 +101,7 @@ impl Processor {
               #[cfg(feature = "tracing")]
               trace!(
                 "{} was blocking, so {:?} is no longer on {:?}",
-                task_rep,
+                last_task_rep,
                 self,
                 machine,
               );

@@ -51,6 +51,7 @@ impl Machine {
 
       // set processor's machine before spawning machine thread
       // so old machine don't hold the processor anymore
+      // only 1 machine is allowed to run same processor at one time
       p.set_machine(&machine);
 
       // spawn machine thread
