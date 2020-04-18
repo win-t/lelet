@@ -92,8 +92,8 @@ impl Processor {
                 trace!("{} is done running on {:?}", last_task_rep, self);
               }
             } else {
-              // put it back in
-              worker.push($task);
+              // put it back in global queue
+              SYSTEM.push($task);
             }
 
             // (*) if the processor is running in another machine, just exit

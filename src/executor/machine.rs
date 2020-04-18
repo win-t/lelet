@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -24,6 +26,10 @@ pub struct Machine {
 }
 
 static MACHINE_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+  static WORKER: RefCell<Option<Rc<WorkerWrapper>>> = RefCell::new(None);
+}
 
 impl Machine {
   fn new() -> (Arc<Machine>, WorkerWrapper) {
@@ -68,12 +74,29 @@ impl Machine {
           }
           drop(initial_task_from);
 
+          let worker = Rc::new(worker);
+          WORKER.with(|w| w.borrow_mut().replace(worker.clone()));
+          defer! {
+            WORKER.with(|w| w.borrow_mut().take());
+          }
+
           p.run_on_machine(&machine, &worker);
         })
       }));
     }
 
     machine
+  }
+
+  #[inline]
+  pub fn direct_push(task: Task) -> Result<(), Task> {
+    WORKER.with(|worker| match worker.borrow().as_ref() {
+      Some(worker) => {
+        worker.push(task);
+        Ok(())
+      }
+      None => Err(task),
+    })
   }
 
   #[inline]

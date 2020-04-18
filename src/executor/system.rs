@@ -198,29 +198,37 @@ impl System {
 
   #[inline]
   pub fn push(&self, t: Task) {
-    let mut index = t.tag().get_schedule_index_hint();
+    match Machine::direct_push(t) {
+      // direct push to machine worker succeeded
+      Ok(()) => {}
 
-    // if the task does not have prefered processor, we pick one
-    if index > self.num_cpus {
-      index = self.processor_push_index_hint.load(Ordering::Relaxed);
+      // Fail, push to processor instead
+      Err(t) => {
+        let mut index = t.tag().get_schedule_index_hint();
 
-      // rotate the index, for fair load
-      self.processor_push_index_hint.compare_and_swap(
-        index,
-        (index + 1) % self.num_cpus,
-        Ordering::Relaxed,
-      );
-    }
+        // if the task does not have prefered processor, we pick one
+        if index > self.num_cpus {
+          index = self.processor_push_index_hint.load(Ordering::Relaxed);
 
-    if !self.processors[index].push_then_wake_up(t) {
-      // cannot send wake up signal to processors[index] (processor is busy),
-      // wake up others
-      let (l, r) = self.processors.split_at((index + 1) % self.num_cpus);
-      r.iter()
-        .chain(l.iter())
-        .map(|p| p.wake_up())
-        .filter(|r| *r)
-        .nth(0);
+          // rotate the index, for fair load
+          self.processor_push_index_hint.compare_and_swap(
+            index,
+            (index + 1) % self.num_cpus,
+            Ordering::Relaxed,
+          );
+        }
+
+        if !self.processors[index].push_then_wake_up(t) {
+          // cannot send wake up signal to processors[index] (processor is busy),
+          // wake up others
+          let (l, r) = self.processors.split_at((index + 1) % self.num_cpus);
+          r.iter()
+            .chain(l.iter())
+            .map(|p| p.wake_up())
+            .filter(|r| *r)
+            .nth(0);
+        }
+      }
     }
   }
 
