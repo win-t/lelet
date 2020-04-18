@@ -46,3 +46,4 @@ mod executor;
 mod thread_pool;
 
 pub use executor::spawn;
+pub use executor::JoinHandle;

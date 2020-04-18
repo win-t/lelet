@@ -118,7 +118,7 @@ impl Processor {
       macro_rules! get_tasks {
         () => {{
           run_counter = 0;
-          let _ = self.injector_notif_recv.try_recv(); // flush the notification channel
+          drop(self.injector_notif_recv.try_recv()); // flush the notification channel
           match SYSTEM.pop(self.index, worker) {
             Some(task) => run_task!(task),
             None => {}
