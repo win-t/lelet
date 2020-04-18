@@ -1,5 +1,4 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use crossbeam_deque::{Injector, Steal, Worker};
@@ -52,24 +51,10 @@ impl Processor {
   }
 
   #[inline]
-  pub fn run_on_machine(
-    &self,
-    current_machine: &Machine,
-    worker: Worker<Task>,
-    old_machine: Option<Arc<Machine>>,
-  ) {
+  pub fn run_on_machine(&self, machine: &Machine, worker: &Worker<Task>) {
     #[cfg(feature = "tracing")]
     crate::thread_pool::THREAD_ID.with(|tid| {
-      trace!(
-        "{:?} is now running on {:?}{} on {:?}",
-        self,
-        current_machine,
-        match old_machine.as_ref() {
-          None => "".into(),
-          Some(machine) => format!(" (prev is {:?})", machine),
-        },
-        tid,
-      );
+      trace!("{:?} is now running on {:?} on {:?}", self, machine, tid);
     });
 
     // Number of runs in a row before the global queue is inspected.
@@ -89,10 +74,10 @@ impl Processor {
           #[cfg(feature = "tracing")]
           let task_rep = format!("{:?}", $task.tag());
 
-          self.mark_blocking(current_machine);
+          self.mark_blocking(machine);
           {
             // there is possibility that (*) is skipped because of race condition
-            if self.still_on_machine(current_machine) {
+            if self.still_on_machine(machine) {
               #[cfg(feature = "tracing")]
               trace!("{} is running on {:?}", task_rep, self);
 
@@ -101,23 +86,23 @@ impl Processor {
               #[cfg(feature = "tracing")]
               trace!("{} is done running on {:?}", task_rep, self);
             } else {
-              // push the thak back, it will be stealed later
+              // put it back in
               worker.push($task);
             }
 
             // (*) if the processor is assigned to another machine, just exit
-            if !self.still_on_machine(current_machine) {
+            if !self.still_on_machine(machine) {
               #[cfg(feature = "tracing")]
               trace!(
                 "{} was blocking, so {:?} is no longer on {:?}",
                 task_rep,
                 self,
-                current_machine,
+                machine,
               );
               return;
             }
           }
-          self.mark_nonblocking(current_machine);
+          self.mark_nonblocking(machine);
 
           run_counter += 1;
           continue 'main;
@@ -128,7 +113,7 @@ impl Processor {
         () => {{
           run_counter = 0;
           let _ = self.injector_notif_recv.try_recv(); // flush the notification channel
-          match SYSTEM.pop(self.index, &worker) {
+          match SYSTEM.pop(self.index, worker) {
             Some(task) => run_task!(task),
             None => {}
           }
@@ -146,40 +131,19 @@ impl Processor {
 
       // at this point, the worker is empty
 
-      // 1. steal from old machine
-      if let Some(old_machine) = old_machine.as_ref() {
-        match old_machine.steal(&worker) {
-          Some(task) => run_task!(task),
-          None => {}
-        }
-      }
-
-      // 2. pop from global queue
+      // 1. pop from global queue
       get_tasks!();
 
-      // 3. steal from others
+      // 2. steal from others
       match SYSTEM.steal(&worker) {
         Some(task) => run_task!(task),
         None => {}
       }
 
-      // 4.a. no more task for now, just sleep
-      if backoff.is_completed() {
-        #[cfg(feature = "tracing")]
-        trace!("{:?} entering sleep", self);
+      // 3.a. no more task for now, just sleep
+      self.sleep(&backoff);
 
-        #[cfg(feature = "tracing")]
-        defer! {
-          trace!("{:?} leaving sleep", self);
-        }
-
-        self.injector_notif_recv.recv().unwrap();
-        backoff.reset();
-      } else {
-        backoff.snooze();
-      }
-
-      // 4.b. after sleep, pop from global queue
+      // 3.b. after sleep, pop from global queue
       get_tasks!();
     }
   }
@@ -218,6 +182,24 @@ impl Processor {
   #[inline]
   pub fn get_last_seen(&self) -> u64 {
     self.last_seen.load(Ordering::Relaxed)
+  }
+
+  #[inline]
+  fn sleep(&self, backoff: &Backoff) {
+    if backoff.is_completed() {
+      #[cfg(feature = "tracing")]
+      trace!("{:?} entering sleep", self);
+
+      #[cfg(feature = "tracing")]
+      defer! {
+        trace!("{:?} leaving sleep", self);
+      }
+
+      self.injector_notif_recv.recv().unwrap();
+      backoff.reset();
+    } else {
+      backoff.snooze();
+    }
   }
 
   #[inline]

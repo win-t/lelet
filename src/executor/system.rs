@@ -79,10 +79,12 @@ pub static SYSTEM: Lazy<&'static System> = Lazy::new(|| {
     }
 
     for index in 0..self_.num_cpus {
-      self_.machines.push(Machine::new_and_take_over_processor(
-        &self_.processors[index],
-        None,
-      ));
+      self_
+        .machines
+        .push(Machine::replace_processor_machine_with_new_one(
+          &self_.processors[index],
+          None,
+        ));
     }
 
     // just to make sure that index between processor and machine is consistent
@@ -136,7 +138,7 @@ impl System {
       }
 
       let current = &self.machines[index];
-      let new = &Machine::new_and_take_over_processor(p, Some(current.clone()));
+      let new = &Machine::replace_processor_machine_with_new_one(p, Some(current.clone()));
 
       #[cfg(feature = "tracing")]
       trace!(
