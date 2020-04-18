@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use lazy_static::lazy_static;
+use once_cell::sync::Lazy;
 
 pub fn abort_on_panic(f: impl FnOnce()) {
   struct Bomb;
@@ -35,9 +35,7 @@ macro_rules! defer {
 }
 
 pub fn monotonic_ms() -> u64 {
-  lazy_static! {
-    static ref START: Instant = Instant::now();
-  }
+  static START: Lazy<Instant> = Lazy::new(|| Instant::now());
   let start = *START;
   Instant::now().duration_since(start).as_millis() as u64
 }
