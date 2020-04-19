@@ -77,7 +77,7 @@ impl Machine {
           let worker = Rc::new(worker);
           WORKER.with(|w| w.borrow_mut().replace(worker.clone()));
           defer! {
-            WORKER.with(|w| w.borrow_mut().take());
+            WORKER.with(|w| drop(w.borrow_mut().take()));
           }
 
           p.run_on_machine(&machine, &worker);

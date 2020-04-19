@@ -35,12 +35,6 @@ a task, it will automatically scale the thread pool.
 Because of this feature, it is always safe for you to do blocking operation in a task,
 you don't need to worry about blocking the entire executor thread.
 
-And like `go` in golang, `spawn` does not return task handle,
-if you need synchronization, you can use [`futures-channel`] or [`std channel`]
-
-[`futures-channel`]: https://docs.rs/futures-channel
-[`std channel`]: https://doc.rust-lang.org/std/sync/mpsc/fn.channel.html
-
 ## Installation
 
 With [cargo add][cargo-add] installed run:

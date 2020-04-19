@@ -47,3 +47,6 @@ mod thread_pool;
 
 pub use executor::spawn;
 pub use executor::JoinHandle;
+
+#[doc(hidden)]
+pub use utils::yield_now;
