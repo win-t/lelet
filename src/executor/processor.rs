@@ -69,9 +69,6 @@ impl Processor {
     'main: loop {
       macro_rules! run_task {
         ($task:ident) => {{
-          // help sysmon before doing task
-          SYSTEM.sysmon_assist();
-
           // update the tag, so this task will be push to this processor again
           $task.tag().set_schedule_index_hint(self.index);
 
@@ -166,6 +163,7 @@ impl Processor {
       return;
     }
     self.last_seen.store(monotonic_ms(), Ordering::Relaxed);
+    SYSTEM.sysmon_wake_up();
   }
 
   #[inline]

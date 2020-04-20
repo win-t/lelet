@@ -31,7 +31,7 @@ macro_rules! defer {
           }
 
           Guard(Some(|| {
-              let _ = { $($body)* };
+              let _: () = { $($body)* };
           }))
       };
   };

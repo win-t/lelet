@@ -1,9 +1,10 @@
 use std::mem::transmute;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use crossbeam_channel::{bounded, Receiver, Sender};
 use crossbeam_deque::Worker;
 use once_cell::sync::Lazy;
 
@@ -18,12 +19,6 @@ use super::Task;
 
 // how long a processor considered to be blocking
 const BLOCKING_THRESHOLD: Duration = Duration::from_millis(10);
-
-// interval of sysmon check, it is okay to be higher than BLOCKING_THRESHOLD
-// because idle processor will assist the sysmon
-// but, worst case scenario, all processor are unable to assist (blocking on task or sleeping)
-// and if that happen, a processor can be blocking up to this value
-const SYSMON_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
 // singleton: SYSTEM
 pub struct System {
@@ -42,8 +37,8 @@ pub struct System {
   machine_steal_index_hint: AtomicUsize,
 
   // for sysmon assist
-  check_running: AtomicBool,
-  check_next: AtomicU64,
+  sysmon_notif: Sender<()>,
+  sysmon_notif_recv: Receiver<()>,
 }
 
 // just to make sure
@@ -59,14 +54,17 @@ pub static SYSTEM: Lazy<&'static System> = Lazy::new(|| {
 
   let num_cpus = std::cmp::max(1, num_cpus::get());
 
+  // channel with buffer size 1 to not miss a notification
+  let (sysmon_notif, sysmon_notif_recv) = bounded(1);
+
   let system = Box::into_raw(Box::new(System {
     num_cpus,
 
     processor_push_index_hint: AtomicUsize::new(0),
     machine_steal_index_hint: AtomicUsize::new(0),
 
-    check_running: AtomicBool::new(false),
-    check_next: AtomicU64::new(monotonic_ms() + BLOCKING_THRESHOLD.as_millis() as u64),
+    sysmon_notif,
+    sysmon_notif_recv,
 
     processors: Vec::with_capacity(num_cpus), // to be initialized later
     machines: Vec::with_capacity(num_cpus),   // to be initialized later
@@ -105,95 +103,71 @@ pub static SYSTEM: Lazy<&'static System> = Lazy::new(|| {
 
 impl System {
   #[inline]
-  fn sysmon_check(&'static self) {
-    let monotonic_ms = monotonic_ms();
-
-    if monotonic_ms < self.check_next.load(Ordering::Relaxed) {
-      // it is not time yet
-      return;
-    }
-
-    if self
-      .check_running
-      .compare_and_swap(false, true, Ordering::Relaxed)
-      == true
-    {
-      // check already running on other thread
-      // only one check allowed at a time
-      return;
-    }
-
-    defer! {
-      self.check_running.store(false, Ordering::Relaxed)
-    }
-
-    let must_seen_at = monotonic_ms - BLOCKING_THRESHOLD.as_millis() as u64;
-
-    for index in 0..self.num_cpus {
-      let p = &self.processors[index];
-
-      if must_seen_at <= p.get_last_seen() {
-        continue;
-      }
-
-      let current = &self.machines[index];
-      let new = &Machine::replace_processor_machine_with_new_one(p, Some(current.clone()));
-
-      #[cfg(feature = "tracing")]
-      trace!(
-        "{:?} is blocking while running on {:?}, replacing with {:?}",
-        p,
-        current,
-        new
-      );
-
-      // force swap on immutable list, atomic update the Arc/pointer in the list
-      // this is safe because:
-      // 1) Arc have same size with AtomicPtr
-      // 2) Arc counter is not touched when swaping, no clone, no drop
-      // 3) only one thread is doing this (guarded by self.check_running)
-      unsafe {
-        // #1
-        if false {
-          // do not run this code, this is for compile time checking only
-          // transmute null_mut() to Arc will surely crashing the program
-          //
-          // https://internals.rust-lang.org/t/compile-time-assert/6751/2
-          transmute::<AtomicPtr<()>, Arc<Machine>>(AtomicPtr::new(std::ptr::null_mut()));
-        }
-
-        // #2
-        let current = transmute::<&Arc<Machine>, &AtomicPtr<()>>(current);
-        let new = transmute::<&Arc<Machine>, &AtomicPtr<()>>(&new);
-        let tmp = current.swap(new.load(Ordering::Relaxed), Ordering::Relaxed);
-        new.store(tmp, Ordering::Relaxed);
-      }
-    }
-
-    self.check_next.store(
-      self
+  fn sysmon_main(&'static self) {
+    'main: loop {
+      let min_last_seen = self
         .processors
         .iter()
         .map(|p| p.get_last_seen())
-        .chain(std::iter::once(monotonic_ms))
         .min()
-        .unwrap()
-        + BLOCKING_THRESHOLD.as_millis() as u64,
-      Ordering::Relaxed,
-    );
-  }
+        .unwrap();
 
-  #[inline]
-  fn sysmon_main(&'static self) {
-    loop {
-      thread::sleep(SYSMON_CHECK_INTERVAL);
-      self.sysmon_check();
+      if min_last_seen > monotonic_ms() {
+        self.sysmon_notif_recv.recv().unwrap();
+        continue 'main;
+      } else {
+        thread::sleep(Duration::from_millis(
+          min_last_seen + BLOCKING_THRESHOLD.as_millis() as u64,
+        ));
+      }
+
+      let must_seen_at = monotonic_ms() - BLOCKING_THRESHOLD.as_millis() as u64;
+      'check: for index in 0..self.num_cpus {
+        let p = &self.processors[index];
+
+        if must_seen_at <= p.get_last_seen() {
+          continue 'check;
+        }
+
+        let current = &self.machines[index];
+        let new = &Machine::replace_processor_machine_with_new_one(p, Some(current.clone()));
+
+        #[cfg(feature = "tracing")]
+        trace!(
+          "{:?} is blocking while running on {:?}, replacing with {:?}",
+          p,
+          current,
+          new
+        );
+
+        // force swap on immutable list, atomic update the Arc/pointer in the list
+        // this is safe because:
+        // 1) Arc have same size with AtomicPtr
+        // 2) Arc counter is not touched when swaping, no clone, no drop
+        // 3) only one thread is doing this (guarded by self.check_running)
+        unsafe {
+          // #1
+          if false {
+            // do not run this code, this is for compile time checking only
+            // transmute null_mut() to Arc will surely crashing the program
+            //
+            // https://internals.rust-lang.org/t/compile-time-assert/6751/2
+            transmute::<AtomicPtr<()>, Arc<Machine>>(AtomicPtr::new(std::ptr::null_mut()));
+          }
+
+          // #2
+          let current = transmute::<&Arc<Machine>, &AtomicPtr<()>>(current);
+          let new = transmute::<&Arc<Machine>, &AtomicPtr<()>>(&new);
+          let tmp = current.swap(new.load(Ordering::Relaxed), Ordering::Relaxed);
+          new.store(tmp, Ordering::Relaxed);
+        }
+      }
     }
   }
 
   #[inline]
-  pub fn sysmon_assist(&'static self) {
-    self.sysmon_check();
+  pub fn sysmon_wake_up(&self) {
+    drop(self.sysmon_notif.try_send(()));
   }
 
   #[inline]
