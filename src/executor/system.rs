@@ -151,7 +151,6 @@ impl System {
           // this is safe because:
           // 1) Arc have same size with AtomicPtr
           // 2) Arc counter is not touched when swaping, no clone, no drop
-          // 3) only one thread is doing this (guarded by self.check_running)
           unsafe {
             // #1
             if false {
