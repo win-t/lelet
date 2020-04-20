@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use crossbeam_deque::{Injector, Steal, Worker};
@@ -21,10 +21,7 @@ pub struct Processor {
   machine_id: AtomicUsize,
 
   // for blocking detection
-  //
-  // invariant: if sleeping is true then last_seen must be usize::Max
   last_seen: AtomicU64,
-  sleeping: AtomicBool,
 
   // global queue dedicated to this processor
   injector: Injector<Task>,
@@ -39,10 +36,7 @@ impl Processor {
 
     let processor = Processor {
       index,
-
       last_seen: AtomicU64::new(u64::MAX),
-      sleeping: AtomicBool::new(false),
-
       injector: Injector::new(),
       injector_notif,
       injector_notif_recv,
@@ -207,19 +201,11 @@ impl Processor {
         trace!("{:?} leaving sleep", self);
       }
 
-      self.sleeping.store(true, Ordering::Relaxed);
       self.injector_notif_recv.recv().unwrap();
-      self.sleeping.store(false, Ordering::Relaxed);
-
       backoff.reset();
     } else {
       backoff.snooze();
     }
-  }
-
-  #[inline]
-  pub fn is_sleeping(&self) -> bool {
-    self.sleeping.load(Ordering::Relaxed)
   }
 
   #[inline]
