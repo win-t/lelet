@@ -105,61 +105,69 @@ impl System {
   #[inline]
   fn sysmon_main(&'static self) {
     'main: loop {
-      let min_last_seen = self
-        .processors
-        .iter()
-        .map(|p| p.get_last_seen())
-        .min()
-        .unwrap();
+      {
+        let min_last_seen = self
+          .processors
+          .iter()
+          .map(|p| p.get_last_seen())
+          .min()
+          .unwrap();
 
-      if min_last_seen > monotonic_ms() {
-        self.sysmon_notif_recv.recv().unwrap();
-        continue 'main;
-      } else {
-        thread::sleep(Duration::from_millis(
-          min_last_seen + BLOCKING_THRESHOLD.as_millis() as u64,
-        ));
+        let now = monotonic_ms();
+        if min_last_seen > now {
+          self.sysmon_notif_recv.recv().unwrap();
+          continue 'main;
+        } else {
+          let next = min_last_seen + BLOCKING_THRESHOLD.as_millis() as u64;
+          if next > now {
+            thread::sleep(Duration::from_millis(next - now));
+          } else {
+            thread::sleep(Duration::from_millis(1));
+          }
+        }
       }
 
-      let must_seen_at = monotonic_ms() - BLOCKING_THRESHOLD.as_millis() as u64;
-      'check: for index in 0..self.num_cpus {
-        let p = &self.processors[index];
+      {
+        let must_seen_at = monotonic_ms() - BLOCKING_THRESHOLD.as_millis() as u64;
+        'check: for index in 0..self.num_cpus {
+          let p = &self.processors[index];
 
-        if must_seen_at <= p.get_last_seen() {
-          continue 'check;
-        }
-
-        let current = &self.machines[index];
-        let new = &Machine::replace_processor_machine_with_new_one(p, Some(current.clone()));
-
-        #[cfg(feature = "tracing")]
-        trace!(
-          "{:?} is blocking while running on {:?}, replacing with {:?}",
-          p,
-          current,
-          new
-        );
-
-        // force swap on immutable list, atomic update the Arc/pointer in the list
-        // this is safe because:
-        // 1) Arc have same size with AtomicPtr
-        // 2) Arc counter is not touched when swaping, no clone, no drop
-        // 3) only one thread is doing this (guarded by self.check_running)
-        unsafe {
-          // #1
-          if false {
-            // do not run this code, this is for compile time checking only
-            // transmute null_mut() to Arc will surely crashing the program
-            //
-            // https://internals.rust-lang.org/t/compile-time-assert/6751/2
-            transmute::<AtomicPtr<()>, Arc<Machine>>(AtomicPtr::new(std::ptr::null_mut()));
+          if must_seen_at <= p.get_last_seen() {
+            continue 'check;
           }
 
-          // #2
-          let current = transmute::<&Arc<Machine>, &AtomicPtr<()>>(current);
-          let new = transmute::<&Arc<Machine>, &AtomicPtr<()>>(&new);
-          let tmp = current.swap(new.load(Ordering::Relaxed), Ordering::Relaxed);
-          new.store(tmp, Ordering::Relaxed);
+          let current = &self.machines[index];
+          let new = &Machine::replace_processor_machine_with_new_one(p, Some(current.clone()));
+
+          #[cfg(feature = "tracing")]
+          trace!(
+            "{:?} is blocking while running on {:?}, replacing with {:?}",
+            p,
+            current,
+            new
+          );
+
+          // force swap on immutable list, atomic update the Arc/pointer in the list
+          // this is safe because:
+          // 1) Arc have same size with AtomicPtr
+          // 2) Arc counter is not touched when swaping, no clone, no drop
+          // 3) only one thread is doing this (guarded by self.check_running)
+          unsafe {
+            // #1
+            if false {
+              // do not run this code, this is for compile time checking only
+              // transmute null_mut() to Arc will surely crashing the program
+              //
+              // https://internals.rust-lang.org/t/compile-time-assert/6751/2
+              transmute::<AtomicPtr<()>, Arc<Machine>>(AtomicPtr::new(std::ptr::null_mut()));
+            }
+
+            // #2
+            let current = transmute::<&Arc<Machine>, &AtomicPtr<()>>(current);
+            let new = transmute::<&Arc<Machine>, &AtomicPtr<()>>(&new);
+            let tmp = current.swap(new.load(Ordering::Relaxed), Ordering::Relaxed);
+            new.store(tmp, Ordering::Relaxed);
+          }
         }
       }
     }
