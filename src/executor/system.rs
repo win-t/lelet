@@ -129,12 +129,27 @@ impl System {
 
     let must_seen_at = monotonic_ms - BLOCKING_THRESHOLD.as_millis() as u64;
 
-    for index in 0..self.num_cpus {
+    'detection: for index in 0..self.num_cpus {
       let p = &self.processors[index];
 
       if must_seen_at <= p.get_last_seen() {
-        continue;
+        continue 'detection;
       }
+
+      // at this point, we detect that p is blocking
+
+      // 1. try to wake up others processor
+
+      for index in 0..self.num_cpus {
+        let p = &self.processors[index];
+        if p.is_sleeping() {
+          if p.wake_up() {
+            continue 'detection;
+          }
+        }
+      }
+
+      // 2. reschedule processor to new machine
 
       let current = &self.machines[index];
       let new = &Machine::replace_processor_machine_with_new_one(p, Some(current.clone()));
