@@ -25,9 +25,6 @@ type Task = async_task::Task<TaskTag>;
 /// # Panic
 ///
 /// When a task panic, it will abort the entire program
-///
-/// [`futures-channel`]: https://docs.rs/futures-channel
-/// [`std channel`]: https://doc.rust-lang.org/std/sync/mpsc/fn.channel.html
 pub fn spawn<F, R>(task: F) -> JoinHandle<R>
 where
   F: Future<Output = R> + Send + 'static,

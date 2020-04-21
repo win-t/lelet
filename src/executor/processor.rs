@@ -36,7 +36,9 @@ impl Processor {
 
     let processor = Processor {
       index,
+
       last_seen: AtomicU64::new(u64::MAX),
+
       injector: Injector::new(),
       injector_notif,
       injector_notif_recv,

@@ -36,7 +36,7 @@ pub struct System {
   // used to select which machine to be stealed first
   machine_steal_index_hint: AtomicUsize,
 
-  // for sysmon assist
+  // for sysmon wake up notification
   sysmon_notif: Sender<()>,
   sysmon_notif_recv: Receiver<()>,
 }

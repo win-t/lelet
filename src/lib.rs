@@ -12,7 +12,7 @@
 //! [`thread::spawn`]: https://doc.rust-lang.org/std/thread/fn.spawn.html
 //! [`spawn`]: fn.spawn.html
 //!
-//! ## Example
+//! # Example
 //!
 //! ```rust,ignore
 //! use std::thread;
