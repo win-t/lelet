@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use crossbeam_deque::{Injector, Steal, Worker};
-use crossbeam_utils::Backoff;
+use crossbeam_utils::{Backoff, CachePadded};
 
 #[cfg(feature = "tracing")]
 use log::trace;
@@ -18,7 +18,7 @@ pub struct Processor {
   pub index: usize,
 
   // current machine that hold the processor
-  machine_id: AtomicUsize,
+  machine_id: CachePadded<AtomicUsize>,
 
   // for blocking detection
   last_seen: AtomicU64,
@@ -44,7 +44,7 @@ impl Processor {
       injector_notif,
       injector_notif_recv,
 
-      machine_id: AtomicUsize::new(usize::MAX), // to be initialized later
+      machine_id: CachePadded::new(AtomicUsize::new(usize::MAX)), // to be initialized later
     };
 
     #[cfg(feature = "tracing")]
@@ -73,9 +73,6 @@ impl Processor {
     'main: loop {
       macro_rules! run_task {
         ($task:ident) => {{
-          // update the tag, so this task will be push to this processor again
-          $task.tag().set_schedule_index_hint(self.index);
-
           self.mark_blocking(machine);
           {
             // there is possibility that (*) is skipped because of race condition
@@ -86,6 +83,8 @@ impl Processor {
                 trace!("{} is running on {:?}", last_task_rep, self);
               }
 
+              // update the tag, so this task will be push to this processor again
+              $task.tag().set_schedule_index_hint(self.index);
               $task.run();
 
               #[cfg(feature = "tracing")]

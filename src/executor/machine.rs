@@ -1,9 +1,12 @@
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use crossbeam_deque::{Steal, Stealer, Worker};
+use once_cell::sync::Lazy;
 
 #[cfg(feature = "tracing")]
 use log::trace;
@@ -127,19 +130,30 @@ impl Drop for Machine {
 }
 
 // this wrapper to make sure that no task is discarded
-// when the worker is dropped
-struct WorkerWrapper(Worker<Task>);
+// when machine done with a worker
+// and cache the unused worker if necessary
+// because creating worker will allocate some memory
+struct WorkerWrapper(Option<Worker<Task>>);
+
+static WORKER_CACHE: Lazy<Mutex<VecDeque<Worker<Task>>>> =
+  Lazy::new(|| Mutex::new(VecDeque::new()));
 
 impl WorkerWrapper {
   fn new() -> WorkerWrapper {
-    WorkerWrapper(Worker::new_fifo())
+    WorkerWrapper(Some(
+      WORKER_CACHE
+        .lock()
+        .unwrap()
+        .pop_front()
+        .unwrap_or_else(Worker::new_fifo),
+    ))
   }
 }
 
 impl std::ops::Deref for WorkerWrapper {
   type Target = Worker<Task>;
   fn deref(&self) -> &Worker<Task> {
-    &self.0
+    self.0.as_ref().unwrap()
   }
 }
 
@@ -148,5 +162,9 @@ impl Drop for WorkerWrapper {
     while let Some(task) = self.pop() {
       SYSTEM.push(task);
     }
+    WORKER_CACHE
+      .lock()
+      .unwrap()
+      .push_back(self.0.take().unwrap());
   }
 }
