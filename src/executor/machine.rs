@@ -37,7 +37,7 @@ impl Machine {
     let stealer = worker.stealer();
     let machine = Machine {
       id: MACHINE_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
-      stealer: stealer,
+      stealer,
     };
 
     #[cfg(feature = "tracing")]
@@ -66,9 +66,8 @@ impl Machine {
           // fill initial tasks
           if let Some(initial_task_from) = initial_task_from.as_ref() {
             loop {
-              match initial_task_from.stealer.steal_batch(&worker) {
-                Steal::Empty => break,
-                _ => {}
+              if let Steal::Empty = initial_task_from.stealer.steal_batch(&worker) {
+                break;
               }
             }
           }
@@ -109,7 +108,7 @@ impl Machine {
         Steal::Empty => None,
         Steal::Retry => unreachable!(), // already filtered
       })
-      .nth(0)
+      .next()
       .unwrap()
   }
 }

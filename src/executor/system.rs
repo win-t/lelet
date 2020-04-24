@@ -1,4 +1,3 @@
-use std::mem::transmute;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -158,12 +157,14 @@ impl System {
               // transmute null_mut() to Arc will surely crashing the program
               //
               // https://internals.rust-lang.org/t/compile-time-assert/6751/2
-              transmute::<AtomicPtr<()>, Arc<Machine>>(AtomicPtr::new(std::ptr::null_mut()));
+              std::mem::transmute::<AtomicPtr<()>, Arc<Machine>>(AtomicPtr::new(
+                std::ptr::null_mut(),
+              ));
             }
 
             // #2
-            let current = transmute::<&Arc<Machine>, &AtomicPtr<()>>(current);
-            let new = transmute::<&Arc<Machine>, &AtomicPtr<()>>(&new);
+            let current = &*(current as *const Arc<Machine> as *const AtomicPtr<()>);
+            let new = &*(new as *const Arc<Machine> as *const AtomicPtr<()>);
             let tmp = current.swap(new.load(Ordering::Relaxed), Ordering::Relaxed);
             new.store(tmp, Ordering::Relaxed);
           }
@@ -174,7 +175,7 @@ impl System {
 
   #[inline]
   pub fn sysmon_wake_up(&self) {
-    drop(self.sysmon_notif.try_send(()));
+    let _ = self.sysmon_notif.try_send(());
   }
 
   #[inline]
@@ -203,11 +204,7 @@ impl System {
           // cannot send wake up signal to processors[index] (processor is busy),
           // wake up others
           let (l, r) = self.processors.split_at((index + 1) % self.num_cpus);
-          r.iter()
-            .chain(l.iter())
-            .map(|p| p.wake_up())
-            .filter(|r| *r)
-            .nth(0);
+          r.iter().chain(l.iter()).map(|p| p.wake_up()).find(|r| *r);
         }
       }
     }
@@ -221,8 +218,7 @@ impl System {
     r.iter()
       .chain(l.iter())
       .map(|p| p.pop(dest))
-      .filter(|s| matches!(s, Some(_)))
-      .nth(0)
+      .find(|s| matches!(s, Some(_)))
       .flatten()
   }
 
@@ -233,8 +229,7 @@ impl System {
     (1..)
       .zip(r.iter().chain(l.iter()))
       .map(|(hint_add, m)| (hint_add, m.steal(dest)))
-      .filter(|(_, s)| matches!(s, Some(_)))
-      .nth(0)
+      .find(|(_, s)| matches!(s, Some(_)))
       .map(|(hint_add, s)| {
         // rotate the index
         self.machine_steal_index_hint.compare_and_swap(

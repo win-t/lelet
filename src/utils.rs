@@ -39,7 +39,7 @@ macro_rules! defer {
 
 #[inline]
 pub fn monotonic_ms() -> u64 {
-  static START: Lazy<Instant> = Lazy::new(|| Instant::now());
+  static START: Lazy<Instant> = Lazy::new(Instant::now);
   let start = *START;
   Instant::now().duration_since(start).as_millis() as u64
 }

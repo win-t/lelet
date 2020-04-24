@@ -15,14 +15,17 @@ pub struct TaskTag {
 
 impl TaskTag {
   pub fn new() -> TaskTag {
+    #[allow(clippy::let_and_return)]
     let tag = TaskTag {
       #[cfg(feature = "tracing")]
       id: TASK_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
 
       schedule_index_hint: AtomicUsize::new(usize::MAX),
     };
+
     #[cfg(feature = "tracing")]
     trace!("{:?} is created", tag);
+
     tag
   }
 

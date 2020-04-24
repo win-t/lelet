@@ -91,6 +91,10 @@ fn thread_main(receiver: Receiver<Job>) {
         // only 1 thread is allowed to exit per IDLE_THRESHOLD
         let now = monotonic_ms();
         let last_exit = POOL.last_exit.load(Ordering::Relaxed);
+
+        // make sure to check first then CAS,
+        // because CAS have side effect
+        #[allow(clippy::collapsible_if)]
         if now - last_exit >= (IDLE_THRESHOLD.as_millis() as u64) {
           if POOL
             .last_exit

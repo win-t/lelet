@@ -34,6 +34,7 @@ impl Processor {
     // channel with buffer size 1 to not miss a notification
     let (injector_notif, injector_notif_recv) = bounded(1);
 
+    #[allow(clippy::let_and_return)]
     let processor = Processor {
       index,
 
@@ -53,6 +54,7 @@ impl Processor {
   }
 
   #[inline]
+  #[allow(clippy::cognitive_complexity)]
   pub fn run_on_machine(&self, machine: &Machine, worker: &Worker<Task>) {
     #[cfg(feature = "tracing")]
     crate::thread_pool::THREAD_ID.with(|tid| {
@@ -117,10 +119,9 @@ impl Processor {
       macro_rules! get_tasks {
         () => {{
           run_counter = 0;
-          drop(self.injector_notif_recv.try_recv()); // flush the notification channel
-          match SYSTEM.pop(self.index, worker) {
-            Some(task) => run_task!(task),
-            None => {}
+          let _ = self.injector_notif_recv.try_recv(); // flush the notification channel
+          if let Some(task) = SYSTEM.pop(self.index, worker) {
+            run_task!(task);
           }
         }};
       }
@@ -140,9 +141,8 @@ impl Processor {
       get_tasks!();
 
       // 2. steal from others
-      match SYSTEM.steal(&worker) {
-        Some(task) => run_task!(task),
-        None => {}
+      if let Some(task) = SYSTEM.steal(&worker) {
+        run_task!(task);
       }
 
       // 3.a. no more task for now, just sleep
@@ -210,10 +210,7 @@ impl Processor {
 
   #[inline]
   pub fn wake_up(&self) -> bool {
-    match self.injector_notif.try_send(()) {
-      Ok(_) => true,
-      Err(_) => false,
-    }
+    self.injector_notif.try_send(()).is_ok()
   }
 
   #[inline]
@@ -232,7 +229,7 @@ impl Processor {
         Steal::Empty => None,
         Steal::Retry => unreachable!(), // already filtered
       })
-      .nth(0)
+      .next()
       .unwrap()
   }
 }
