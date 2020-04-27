@@ -80,30 +80,19 @@ impl Processor {
 
         let sleep_backoff = Backoff::new();
 
-        #[cfg(feature = "tracing")]
-        let mut last_task_info = String::new();
-
         'main: loop {
             // mark this processor still healthy
             self.last_seen.store(system.now(), Ordering::Relaxed);
 
             macro_rules! run_task {
-                ($task:ident) => {{
+                ($task:ident) => {
                     if self.still_on_machine(machine) {
                         #[cfg(feature = "tracing")]
-                        {
-                            last_task_info = format!("{:?}", $task.tag());
-                            trace!("{} is running on {:?}", last_task_info, self);
-                        }
+                        trace!("{:?} is running on {:?}", $task.tag(), self);
 
                         // update the tag, so this task will be push to this processor again
                         $task.tag().set_schedule_index_hint(self.index);
                         $task.run();
-
-                        #[cfg(feature = "tracing")]
-                        {
-                            trace!("{} is done running on {:?}", last_task_info, self);
-                        }
                     } else {
                         // there is possibility that (*) is skipped because of race condition,
                         // put it back in global queue
@@ -113,29 +102,22 @@ impl Processor {
                     // (*) if the processor is running in another machine after we run the task,
                     // that mean the task is blocking, just exit
                     if !self.still_on_machine(machine) {
-                        #[cfg(feature = "tracing")]
-                        trace!(
-                            "{} was blocking {:?} when on {:?}",
-                            last_task_info,
-                            self,
-                            machine,
-                        );
                         return;
                     }
 
                     run_counter += 1;
                     continue 'main;
-                }};
+                };
             }
 
             macro_rules! get_tasks {
-                () => {{
+                () => {
                     run_counter = 0;
                     let _ = self.injector_notif_recv.try_recv(); // flush the notification channel
                     if let Some(task) = system.pop(self.index, worker) {
                         run_task!(task);
                     }
-                }};
+                };
             }
 
             if run_counter >= MAX_RUNS {
@@ -204,6 +186,9 @@ impl Processor {
     }
 
     pub fn push(&self, t: Task) {
+        #[cfg(feature = "tracing")]
+        trace!("{:?} pushed to {:?}", t.tag(), self);
+
         self.injector.push(t);
     }
 

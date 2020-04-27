@@ -17,7 +17,7 @@ pub fn abort_on_panic(f: impl FnOnce()) {
 }
 
 macro_rules! defer {
-  ($($body:tt)*) => {{
+  ($($body:tt)*) => {
       let _guard = {
           pub struct Guard<F: FnOnce()>(Option<F>);
 
@@ -31,7 +31,7 @@ macro_rules! defer {
               let _: () = { $($body)* };
           }))
       };
-  }};
+  };
 }
 
 struct Yields(usize);

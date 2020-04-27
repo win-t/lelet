@@ -111,6 +111,13 @@ impl Machine {
                 machine,
                 worker,
             }) if processor.still_on_machine(machine) => {
+                #[cfg(feature = "tracing")]
+                trace!(
+                    "{:?} pushed directly to {:?}'s machine",
+                    task.tag(),
+                    processor,
+                );
+
                 worker.push(task);
                 Ok(())
             }

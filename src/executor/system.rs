@@ -135,10 +135,8 @@ impl System {
 
                 #[cfg(feature = "tracing")]
                 trace!(
-                    "{:?} is blocking while running on {:?}, replacing with {:?}",
+                    "{:?} was blocked, replacing the machine",
                     p,
-                    current,
-                    new
                 );
 
                 // force swap on immutable list, atomic update the Arc/pointer in the list
