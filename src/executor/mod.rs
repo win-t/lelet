@@ -12,7 +12,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use self::system::SYSTEM;
+use self::system::System;
 use self::task::TaskTag;
 
 type Task = async_task::Task<TaskTag>;
@@ -30,7 +30,7 @@ where
     F: Future<Output = R> + Send + 'static,
     R: Send + 'static,
 {
-    let system = SYSTEM.get();
+    let system = System::get();
     let (task, handle) = async_task::spawn(task, move |t| system.push(t), TaskTag::new());
     task.schedule();
     JoinHandle(handle)

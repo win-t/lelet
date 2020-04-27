@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use crossbeam_deque::{Injector, Steal, Worker};
@@ -20,7 +20,7 @@ pub struct Processor {
 
     /// for blocking detection
     /// usize::MAX mean the processor is sleeping
-    last_seen: AtomicUsize,
+    last_seen: AtomicU64,
 
     /// global queue dedicated to this processor
     injector: Injector<Task>,
@@ -43,7 +43,7 @@ impl Processor {
         let processor = Processor {
             index,
 
-            last_seen: AtomicUsize::new(usize::MAX),
+            last_seen: AtomicU64::new(u64::MAX),
 
             injector: Injector::new(),
             injector_notif,
@@ -176,7 +176,7 @@ impl Processor {
               trace!("{:?} leaving sleep", self);
             }
 
-            self.last_seen.store(usize::MAX, Ordering::Relaxed);
+            self.last_seen.store(u64::MAX, Ordering::Relaxed);
             self.injector_notif_recv.recv().unwrap();
             self.last_seen.store(system.now(), Ordering::Relaxed);
             system.sysmon_wake_up();
@@ -194,7 +194,7 @@ impl Processor {
 
     /// will return usize::MAX when processor is idle (always seen in the future)
     #[inline(always)]
-    pub fn get_last_seen(&self) -> usize {
+    pub fn get_last_seen(&self) -> u64 {
         self.last_seen.load(Ordering::Relaxed)
     }
 
@@ -203,10 +203,8 @@ impl Processor {
         self.injector_notif.try_send(()).is_ok()
     }
 
-    /// return true if wake up signal is delivered
-    pub fn push_then_wake_up(&self, t: Task) -> bool {
+    pub fn push(&self, t: Task) {
         self.injector.push(t);
-        self.wake_up()
     }
 
     pub fn pop(&self, dest: &Worker<Task>) -> Option<Task> {

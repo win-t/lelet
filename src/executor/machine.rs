@@ -15,7 +15,7 @@ use crate::thread_pool;
 use crate::utils::abort_on_panic;
 
 use super::processor::{Processor, RunContext};
-use super::system::SYSTEM;
+use super::system::System;
 use super::Task;
 
 /// Machine is the one who have thread
@@ -93,7 +93,7 @@ impl Machine {
                     }
 
                     processor.run(&RunContext {
-                        system: SYSTEM.get(),
+                        system: System::get(),
                         machine: &machine,
                         worker: &worker,
                     });
@@ -174,7 +174,7 @@ impl std::ops::Deref for WorkerWrapper {
 
 impl Drop for WorkerWrapper {
     fn drop(&mut self) {
-        let system = SYSTEM.get();
+        let system = System::get();
         while let Some(task) = self.pop() {
             system.push(task);
         }

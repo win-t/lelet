@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -37,7 +37,7 @@ pub struct System {
 
     /// for blocking detection
     /// 1 tick = BLOCKING_THRESHOLD/2
-    tick: AtomicUsize,
+    tick: AtomicU64,
 
     // for sysmon wake up notification
     sysmon_notif: Sender<()>,
@@ -52,7 +52,7 @@ impl Drop for System {
     }
 }
 
-pub static SYSTEM: Lazy<&'static System> = Lazy::new(|| {
+static SYSTEM: Lazy<&'static System> = Lazy::new(|| {
     #[cfg(feature = "tracing")]
     trace!("Creating system");
 
@@ -67,7 +67,7 @@ pub static SYSTEM: Lazy<&'static System> = Lazy::new(|| {
         processor_push_index_hint: AtomicUsize::new(0),
         machine_steal_index_hint: AtomicUsize::new(0),
 
-        tick: AtomicUsize::new(0),
+        tick: AtomicU64::new(0),
 
         sysmon_notif,
         sysmon_notif_recv,
@@ -98,8 +98,8 @@ pub static SYSTEM: Lazy<&'static System> = Lazy::new(|| {
 });
 
 impl System {
-    pub fn get(&'static self) -> &'static System {
-        self
+    pub fn get() -> &'static System {
+        &SYSTEM
     }
 
     fn sysmon_main(&'static self) {
@@ -169,16 +169,8 @@ impl System {
                 .processors
                 .iter()
                 .map(|p| p.get_last_seen())
-                .all(|last_seen| last_seen == usize::MAX)
+                .all(|last_seen| last_seen == u64::MAX)
             {
-                #[cfg(feature = "tracing")]
-                trace!("sysmon entering sleep");
-
-                #[cfg(feature = "tracing")]
-                defer! {
-                  trace!("sysmon leaving sleep");
-                }
-
                 // all processor is sleeping, also go to sleep
                 self.sysmon_notif_recv.recv().unwrap();
             }
@@ -210,8 +202,11 @@ impl System {
                     );
                 }
 
-                if !self.processors[index].push_then_wake_up(t) {
-                    // cannot send wake up signal to processors[index] (processor is busy),
+                let processor = &self.processors[index];
+                processor.push(t);
+
+                if !processor.wake_up() {
+                    // cannot send wake up signal (processor is busy),
                     // wake up others
                     let (l, r) = self.processors.split_at((index + 1) % self.num_cpus);
                     r.iter().chain(l.iter()).map(|p| p.wake_up()).find(|r| *r);
@@ -251,7 +246,7 @@ impl System {
     }
 
     #[inline(always)]
-    pub fn now(&self) -> usize {
+    pub fn now(&self) -> u64 {
         self.tick.load(Ordering::Relaxed)
     }
 }
