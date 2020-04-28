@@ -87,6 +87,9 @@ impl Processor {
 
             macro_rules! run_task {
                 ($task:ident) => {
+                    #[cfg(feature = "tracing")]
+                    let last_task = format!("{:?}", $task.tag());
+
                     if self.still_on_machine(machine) {
                         #[cfg(feature = "tracing")]
                         trace!("{:?} is running on {:?}", $task.tag(), self);
@@ -100,9 +103,20 @@ impl Processor {
                         system.push($task);
                     }
 
+                    #[cfg(feature = "tracing")]
+                    if self.still_on_machine(machine) {
+                        trace!("{} is done running on {:?}", last_task, self);
+                    }
+
                     if !self.still_on_machine(machine) {
                         // (*) we now running on thread on machine without processor (stealed)
                         // that mean the task was blocking, MUST exit now
+
+                        #[cfg(feature = "tracing")]
+                        crate::thread_pool::THREAD_ID.with(|tid| {
+                            trace!("{} was blocking on {:?} on {:?}", last_task, machine, tid);
+                        });
+
                         return;
                     }
 
