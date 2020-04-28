@@ -23,7 +23,7 @@ pub struct Machine {
     pub id: usize,
 
     /// stealer for the machine, Worker part is not here,
-    /// and moved via closure, because Worker is !Send+!Sync
+    /// and moved via closure, because Worker is !Sync
     stealer: Stealer<Task>,
 }
 

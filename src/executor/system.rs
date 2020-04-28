@@ -181,10 +181,9 @@ impl System {
 
             // if the task does not have prefered processor, we pick one
             if index >= self.num_cpus {
-                index = self
-                    .processor_push_index_hint
-                    .fetch_add(1, Ordering::Relaxed)
-                    % self.num_cpus;
+                index = self.processor_push_index_hint.load(Ordering::Relaxed);
+                self.processor_push_index_hint
+                    .store((index + 1) % self.num_cpus, Ordering::Relaxed);
             }
 
             let processor = &self.processors[index];
@@ -192,7 +191,7 @@ impl System {
 
             if !processor.wake_up() {
                 // cannot send wake up signal (processor is busy), wake up others
-                let (l, r) = self.processors.split_at((index + 1) % self.num_cpus);
+                let (l, r) = self.processors.split_at(index + 1);
                 r.iter().chain(l.iter()).find(|p| p.wake_up());
             }
         }
@@ -210,7 +209,7 @@ impl System {
     }
 
     pub fn steal(&self, worker: &Worker<Task>) -> Option<Task> {
-        let m = self.machine_steal_index_hint.load(Ordering::Relaxed) % self.num_cpus;
+        let m = self.machine_steal_index_hint.load(Ordering::Relaxed);
         let (l, r) = self.machines.split_at(m);
         (1..)
             .zip(r.iter().chain(l.iter()))
@@ -218,7 +217,7 @@ impl System {
             .find(|(_, s)| s.is_some())
             .map(|(hint_add, s)| {
                 self.machine_steal_index_hint
-                    .fetch_add(hint_add, Ordering::Relaxed);
+                    .store((m + hint_add) % self.num_cpus, Ordering::Relaxed);
                 s
             })
             .flatten()
