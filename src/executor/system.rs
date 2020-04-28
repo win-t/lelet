@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -19,7 +19,7 @@ use super::Task;
 /// how long a processor considered to be blocking
 const BLOCKING_THRESHOLD: Duration = Duration::from_millis(10);
 
-/// singleton: SYSTEM
+// singleton: SYSTEM
 pub struct System {
     num_cpus: usize,
 
@@ -134,28 +134,25 @@ impl System {
                 let new = &Machine::replace(p, Some(current.clone()));
 
                 #[cfg(feature = "tracing")]
-                trace!(
-                    "{:?} was blocked, replacing the machine",
-                    p,
-                );
+                trace!("{:?} was blocked, replacing the machine", p);
 
-                // force swap on immutable list, atomic update the Arc/pointer in the list
-                // this is safe because:
-                // 1) Arc have same size with AtomicPtr
-                // 2) Arc counter is not touched when swaping, no clone, no drop
                 unsafe {
-                    // #1
+                    use std::sync::atomic::AtomicPtr;
+
+                    // force swap on immutable list, atomic update the Arc/pointer in the list
+                    // this is safe because:
+                    // (1) Arc have same size with AtomicPtr
+                    // (2) Arc counter is not touched when swaping, no clone, no drop
+
+                    // to make sure (1) at compile time
+                    // https://internals.rust-lang.org/t/compile-time-assert/6751/2
                     if false {
-                        // do not run this code, this is for compile time checking only
-                        // transmute null_mut() to Arc will surely crashing the program
-                        //
-                        // https://internals.rust-lang.org/t/compile-time-assert/6751/2
-                        std::mem::transmute::<AtomicPtr<()>, Arc<Machine>>(AtomicPtr::new(
-                            std::ptr::null_mut(),
-                        ));
+                        // do not run this code, transmute invalid AtomicPtr to Arc
+                        // will surely crashing the program
+                        std::mem::transmute::<AtomicPtr<()>, Arc<Machine>>(AtomicPtr::default());
                     }
 
-                    // #2
+                    // (2) is just AtomicPtr swap
                     let current = &*(current as *const Arc<Machine> as *const AtomicPtr<()>);
                     let new = &*(new as *const Arc<Machine> as *const AtomicPtr<()>);
                     let tmp = current.swap(new.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -166,8 +163,7 @@ impl System {
             if self
                 .processors
                 .iter()
-                .map(|p| p.get_last_seen())
-                .all(|last_seen| last_seen == u64::MAX)
+                .all(|p| p.get_last_seen() == u64::MAX)
             {
                 // all processor is sleeping, also go to sleep
                 self.sysmon_notif_recv.recv().unwrap();
@@ -179,65 +175,50 @@ impl System {
         let _ = self.sysmon_notif.try_send(());
     }
 
-    pub fn push(&self, t: Task) {
-        match Machine::direct_push(t) {
-            // direct push to machine worker succeeded
-            Ok(()) => {}
+    pub fn push(&self, task: Task) {
+        if let Err(task) = Machine::direct_push(task) {
+            let mut index = task.tag().get_schedule_index_hint();
 
-            // Fail, push to processor instead
-            Err(t) => {
-                let mut index = t.tag().get_schedule_index_hint();
+            // if the task does not have prefered processor, we pick one
+            if index >= self.num_cpus {
+                index = self
+                    .processor_push_index_hint
+                    .fetch_add(1, Ordering::Relaxed)
+                    % self.num_cpus;
+            }
 
-                // if the task does not have prefered processor, we pick one
-                if index >= self.num_cpus {
-                    index = self.processor_push_index_hint.load(Ordering::Relaxed);
+            let processor = &self.processors[index];
+            processor.push(task);
 
-                    // rotate the index, for fair load
-                    self.processor_push_index_hint.compare_and_swap(
-                        index,
-                        (index + 1) % self.num_cpus,
-                        Ordering::Relaxed,
-                    );
-                }
-
-                let processor = &self.processors[index];
-                processor.push(t);
-
-                if !processor.wake_up() {
-                    // cannot send wake up signal (processor is busy),
-                    // wake up others
-                    let (l, r) = self.processors.split_at((index + 1) % self.num_cpus);
-                    r.iter().chain(l.iter()).map(|p| p.wake_up()).find(|r| *r);
-                }
+            if !processor.wake_up() {
+                // cannot send wake up signal (processor is busy), wake up others
+                let (l, r) = self.processors.split_at((index + 1) % self.num_cpus);
+                r.iter().chain(l.iter()).find(|p| p.wake_up());
             }
         }
     }
 
-    pub fn pop(&self, index: usize, dest: &Worker<Task>) -> Option<Task> {
+    pub fn pop(&self, index: usize, worker: &Worker<Task>) -> Option<Task> {
         // pop from global queue that dedicated to processor[index],
         // if None, pop from others
         let (l, r) = self.processors.split_at(index);
         r.iter()
             .chain(l.iter())
-            .map(|p| p.pop(dest))
-            .find(|s| matches!(s, Some(_)))
+            .map(|p| p.pop(worker))
+            .find(|s| s.is_some())
             .flatten()
     }
 
-    pub fn steal(&self, dest: &Worker<Task>) -> Option<Task> {
-        let m = self.machine_steal_index_hint.load(Ordering::Relaxed);
+    pub fn steal(&self, worker: &Worker<Task>) -> Option<Task> {
+        let m = self.machine_steal_index_hint.load(Ordering::Relaxed) % self.num_cpus;
         let (l, r) = self.machines.split_at(m);
         (1..)
             .zip(r.iter().chain(l.iter()))
-            .map(|(hint_add, m)| (hint_add, m.steal(dest)))
-            .find(|(_, s)| matches!(s, Some(_)))
+            .map(|(hint_add, m)| (hint_add, m.steal(worker)))
+            .find(|(_, s)| s.is_some())
             .map(|(hint_add, s)| {
-                // rotate the index
-                self.machine_steal_index_hint.compare_and_swap(
-                    m,
-                    (m + hint_add) % self.num_cpus,
-                    Ordering::Relaxed,
-                );
+                self.machine_steal_index_hint
+                    .fetch_add(hint_add, Ordering::Relaxed);
                 s
             })
             .flatten()

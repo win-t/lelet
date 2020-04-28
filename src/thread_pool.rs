@@ -33,6 +33,7 @@ thread_local! {
 
 type Job = Box<dyn FnOnce() + Send>;
 
+// singleton: POOL
 struct Pool {
     base: Instant,
     next_exit: AtomicUsize,
@@ -55,54 +56,57 @@ impl Pool {
         self.sender.try_send(job).unwrap_or_else(|err| match err {
             TrySendError::Full(job) => {
                 let receiver = self.receiver.clone();
-                thread::spawn(move || thread_main(self, receiver));
+                thread::spawn(move || self.main(receiver));
                 self.sender.send(job).unwrap();
             }
             TrySendError::Disconnected(_) => unreachable!(), // we hold both side of the channel
         });
     }
-}
 
-fn thread_main(pool: &Pool, receiver: Receiver<Job>) {
-    #[cfg(feature = "tracing")]
-    THREAD_ID.with(|id| {
-        id.0.set(THREAD_ID_COUNTER.fetch_add(1, Ordering::Relaxed));
-        trace!("{:?} is created", id);
-    });
+    fn main(&self, receiver: Receiver<Job>) {
+        #[cfg(feature = "tracing")]
+        THREAD_ID.with(|id| {
+            id.0.set(THREAD_ID_COUNTER.fetch_add(1, Ordering::Relaxed));
+            trace!("{:?} is created", id);
+        });
 
-    loop {
-        match receiver.recv_timeout(IDLE_THRESHOLD) {
-            Ok(job) => {
-                #[cfg(feature = "tracing")]
-                THREAD_ID.with(|id| {
-                    trace!("{:?} is running", id);
-                });
+        loop {
+            match receiver.recv_timeout(IDLE_THRESHOLD) {
+                Ok(job) => {
+                    #[cfg(feature = "tracing")]
+                    THREAD_ID.with(|id| {
+                        trace!("{:?} is running", id);
+                    });
 
-                job();
+                    job();
 
-                #[cfg(feature = "tracing")]
-                THREAD_ID.with(|id| {
-                    trace!("{:?} is done and cached for reused", id);
-                });
-            }
-            _ => {
-                // only 1 thread is allowed to exit per IDLE_THRESHOLD
-                let now = Instant::now();
-                let next_exit = pool.next_exit.load(Ordering::Relaxed);
-                if now.duration_since(pool.base).as_secs() as usize >= next_exit {
-                    let new_next_exit =
-                        (now + IDLE_THRESHOLD).duration_since(pool.base).as_secs() as usize;
-                    if POOL
-                        .next_exit
-                        .compare_and_swap(next_exit, new_next_exit, Ordering::Relaxed)
-                        == next_exit
-                    {
-                        #[cfg(feature = "tracing")]
-                        THREAD_ID.with(|id| {
-                            trace!("{:?} is exiting", id);
-                        });
+                    #[cfg(feature = "tracing")]
+                    THREAD_ID.with(|id| {
+                        trace!("{:?} is done and cached for reused", id);
+                    });
+                }
+                _ => {
+                    let now = Instant::now();
+                    let next_exit = self.next_exit.load(Ordering::Relaxed);
+                    if now.duration_since(self.base).as_secs() as usize >= next_exit {
+                        let new_next_exit =
+                            (now + IDLE_THRESHOLD).duration_since(self.base).as_secs() as usize;
 
-                        return;
+                        // only 1 thread is allowed to exit per IDLE_THRESHOLD
+                        // ensure it via CAS
+                        if POOL.next_exit.compare_and_swap(
+                            next_exit,
+                            new_next_exit,
+                            Ordering::Relaxed,
+                        ) == next_exit
+                        {
+                            #[cfg(feature = "tracing")]
+                            THREAD_ID.with(|id| {
+                                trace!("{:?} is exiting", id);
+                            });
+
+                            return;
+                        }
                     }
                 }
             }
@@ -110,6 +114,7 @@ fn thread_main(pool: &Pool, receiver: Receiver<Job>) {
     }
 }
 
+#[inline(always)]
 pub fn spawn_box(job: Job) {
     POOL.put_job(job);
 }

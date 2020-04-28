@@ -18,13 +18,12 @@ use super::processor::{Processor, RunContext};
 use super::system::System;
 use super::Task;
 
-/// Machine is the one who have thread
-/// every machine have thier own local Worker queue
+/// Machine is the one who have OS thread
 pub struct Machine {
     pub id: usize,
 
-    /// stealer for the machine, worker part is moved via closure,
-    /// because Worker is !Send+!Sync
+    /// stealer for the machine, Worker part is not here,
+    /// and moved via closure, because Worker is !Send+!Sync
     stealer: Stealer<Task>,
 }
 
@@ -37,7 +36,7 @@ struct Current {
 }
 
 thread_local! {
-  static CURRENT: RefCell<Option<Current>> = RefCell::new(None);
+  static CURRENT_TLS: RefCell<Option<Current>> = RefCell::new(None);
 }
 
 impl Machine {
@@ -55,57 +54,55 @@ impl Machine {
         (Arc::new(machine), worker)
     }
 
-    pub fn replace(
-        processor: &'static Processor,
-        old_machine: Option<Arc<Machine>>,
-    ) -> Arc<Machine> {
-        // just to make sure that the old machine is current processor's machine
-        if let Some(old_machine) = old_machine.as_ref() {
-            assert!(processor.still_on_machine(old_machine));
+    pub fn replace(processor: &'static Processor, current: Option<Arc<Machine>>) -> Arc<Machine> {
+        // just to make sure that the current machine is current processor's machine
+        if let Some(current) = current.as_ref() {
+            assert!(processor.still_on_machine(current));
         }
 
-        let (machine, worker) = Machine::new();
+        let (new, worker) = Machine::new();
         {
-            let machine = machine.clone();
+            let new = new.clone();
             thread_pool::spawn_box(Box::new(move || {
                 abort_on_panic(move || {
-                    // initialize/steal task from old machine
-                    if let Some(old_machine) = old_machine {
+                    // initialize/steal task from current machine
+                    if let Some(current) = current {
                         loop {
-                            if let Steal::Empty = old_machine.stealer.steal_batch(&worker) {
+                            if let Steal::Empty = current.stealer.steal_batch(&worker) {
                                 break;
                             }
                         }
-                        drop(old_machine);
+                        drop(current);
                     }
 
                     let worker = Rc::new(worker);
 
-                    CURRENT.with(|current| {
+                    CURRENT_TLS.with(|current| {
                         current.borrow_mut().replace(Current {
                             processor,
-                            machine: machine.clone(),
+                            machine: new.clone(),
                             worker: worker.clone(),
                         })
                     });
                     defer! {
-                      CURRENT.with(|current| drop(current.borrow_mut().take()));
+                      CURRENT_TLS.with(|current| drop(current.borrow_mut().take()));
                     }
 
+                    // run processor with new machine
                     processor.run(&RunContext {
                         system: System::get(),
-                        machine: &machine,
+                        machine: &new,
                         worker: &worker,
                     });
                 })
             }));
         }
 
-        machine
+        new
     }
 
     pub fn direct_push(task: Task) -> Result<(), Task> {
-        CURRENT.with(|current| match current.borrow().as_ref() {
+        CURRENT_TLS.with(|current| match current.borrow().as_ref() {
             Some(Current {
                 processor,
                 machine,
@@ -125,20 +122,20 @@ impl Machine {
         })
     }
 
-    pub fn steal(&self, dest: &Worker<Task>) -> Option<Task> {
-        // retry until success or empty
-        std::iter::repeat_with(|| self.stealer.steal_batch_and_pop(dest))
-            .filter(|s| !matches!(s, Steal::Retry))
+    pub fn steal(&self, worker: &Worker<Task>) -> Option<Task> {
+        // repeat until success or empty
+        std::iter::repeat_with(|| self.stealer.steal_batch_and_pop(worker))
+            .find(|s| !s.is_retry())
             .map(|s| match s {
                 Steal::Success(task) => Some(task),
                 Steal::Empty => None,
                 Steal::Retry => unreachable!(), // already filtered
             })
-            .next()
-            .unwrap()
+            .flatten()
     }
 }
 
+#[cfg(feature = "tracing")]
 impl std::fmt::Debug for Machine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&format!("Machine({})", self.id))

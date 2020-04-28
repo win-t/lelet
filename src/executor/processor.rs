@@ -22,7 +22,7 @@ pub struct Processor {
     /// usize::MAX mean the processor is sleeping
     last_seen: AtomicU64,
 
-    /// global queue dedicated to this processor
+    // global queue dedicated to this processor
     injector: Injector<Task>,
     injector_notif: Sender<()>,
     injector_notif_recv: Receiver<()>,
@@ -49,7 +49,7 @@ impl Processor {
             injector_notif,
             injector_notif_recv,
 
-            machine_id: AtomicUsize::new(usize::MAX),
+            machine_id: AtomicUsize::new(usize::MAX), // no machine
         };
 
         #[cfg(feature = "tracing")]
@@ -66,6 +66,7 @@ impl Processor {
             ..
         } = ctx;
 
+        // steal self from old machine
         self.machine_id.store(machine.id, Ordering::Relaxed);
         self.last_seen.store(system.now(), Ordering::Relaxed);
 
@@ -75,7 +76,7 @@ impl Processor {
         });
 
         // Number of runs in a row before the global queue is inspected.
-        const MAX_RUNS: usize = 64;
+        const MAX_RUNS: usize = 16;
         let mut run_counter = 0;
 
         let sleep_backoff = Backoff::new();
@@ -99,9 +100,9 @@ impl Processor {
                         system.push($task);
                     }
 
-                    // (*) if the processor is running in another machine after we run the task,
-                    // that mean the task is blocking, just exit
                     if !self.still_on_machine(machine) {
+                        // (*) we now running on thread on machine without processor (stealed)
+                        // that mean the task was blocking, MUST exit now
                         return;
                     }
 
@@ -161,6 +162,8 @@ impl Processor {
             self.last_seen.store(u64::MAX, Ordering::Relaxed);
             self.injector_notif_recv.recv().unwrap();
             self.last_seen.store(system.now(), Ordering::Relaxed);
+
+            // wake the sysmon in case the sysmon is also sleeping
             system.sysmon_wake_up();
 
             backoff.reset();
@@ -174,7 +177,7 @@ impl Processor {
         self.machine_id.load(Ordering::Relaxed) == machine.id
     }
 
-    /// will return usize::MAX when processor is idle (always seen in the future)
+    /// will return usize::MAX when processor is sleeping (always seen in the future)
     #[inline(always)]
     pub fn get_last_seen(&self) -> u64 {
         self.last_seen.load(Ordering::Relaxed)
@@ -185,27 +188,27 @@ impl Processor {
         self.injector_notif.try_send(()).is_ok()
     }
 
-    pub fn push(&self, t: Task) {
+    pub fn push(&self, task: Task) {
         #[cfg(feature = "tracing")]
-        trace!("{:?} pushed to {:?}", t.tag(), self);
+        trace!("{:?} pushed to {:?}", task.tag(), self);
 
-        self.injector.push(t);
+        self.injector.push(task);
     }
 
-    pub fn pop(&self, dest: &Worker<Task>) -> Option<Task> {
-        // retry until success or empty
-        std::iter::repeat_with(|| self.injector.steal_batch_and_pop(dest))
-            .filter(|s| !matches!(s, Steal::Retry))
+    pub fn pop(&self, worker: &Worker<Task>) -> Option<Task> {
+        // repeat until success or empty
+        std::iter::repeat_with(|| self.injector.steal_batch_and_pop(worker))
+            .find(|s| !s.is_retry())
             .map(|s| match s {
                 Steal::Success(task) => Some(task),
                 Steal::Empty => None,
                 Steal::Retry => unreachable!(), // already filtered
             })
-            .next()
-            .unwrap()
+            .flatten()
     }
 }
 
+#[cfg(feature = "tracing")]
 impl std::fmt::Debug for Processor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&format!("Processor({})", self.index))
