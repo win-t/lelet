@@ -27,9 +27,8 @@ pub struct Machine {
 static MACHINE_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 struct Current {
-    processor: &'static Processor,
     machine: Arc<Machine>,
-    worker: Rc<Worker<Task>>,
+    wrapper: Rc<WorkerWrapper>,
 }
 
 thread_local! {
@@ -37,8 +36,8 @@ thread_local! {
 }
 
 impl Machine {
-    fn new() -> (Arc<Machine>, Worker<Task>) {
-        let worker = Worker::new_fifo();
+    fn new(processor: &'static Processor) -> (Arc<Machine>, WorkerWrapper) {
+        let worker = WorkerWrapper::new(processor);
         let stealer = worker.stealer();
         let machine = Machine {
             id: MACHINE_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
@@ -57,7 +56,7 @@ impl Machine {
             assert!(processor.still_on_machine(current));
         }
 
-        let (new, worker) = Machine::new();
+        let (new, worker) = Machine::new(processor);
         {
             let new = new.clone();
             thread_pool::spawn_box(Box::new(move || {
@@ -66,9 +65,8 @@ impl Machine {
 
                     CURRENT_TLS.with(|tls| {
                         tls.borrow_mut().replace(Current {
-                            processor,
                             machine: new.clone(),
-                            worker: worker.clone(),
+                            wrapper: worker.clone(),
                         })
                     });
                     defer! {
@@ -90,23 +88,25 @@ impl Machine {
     }
 
     pub fn direct_push(task: Task) -> Result<(), Task> {
-        CURRENT_TLS.with(|current| match current.borrow().as_ref() {
-            Some(Current {
-                processor,
-                machine,
-                worker,
-            }) if processor.still_on_machine(machine) => {
-                #[cfg(feature = "tracing")]
-                trace!(
-                    "{:?} pushed directly to {:?}'s machine",
-                    task.tag(),
-                    processor,
-                );
+        CURRENT_TLS.with(|tls| match tls.borrow().as_ref() {
+            Some(Current { machine, wrapper }) => {
+                let processor = wrapper.0;
+                let worker = &wrapper.1;
+                if processor.still_on_machine(machine) {
+                    #[cfg(feature = "tracing")]
+                    trace!(
+                        "{:?} pushed directly to {:?}'s machine",
+                        task.tag(),
+                        processor,
+                    );
 
-                worker.push(task);
-                Ok(())
+                    worker.push(task);
+                    Ok(())
+                } else {
+                    Err(task)
+                }
             }
-            _ => Err(task),
+            None => Err(task),
         })
     }
 
@@ -134,5 +134,32 @@ impl std::fmt::Debug for Machine {
 impl Drop for Machine {
     fn drop(&mut self) {
         trace!("{:?} is destroyed", self);
+    }
+}
+
+/// this wrapper to make sure that no task is discarded
+/// when a machine done with a worker
+struct WorkerWrapper(&'static Processor, Worker<Task>);
+
+impl WorkerWrapper {
+    fn new(p: &'static Processor) -> WorkerWrapper {
+        WorkerWrapper(p, Worker::new_fifo())
+    }
+}
+
+impl std::ops::Deref for WorkerWrapper {
+    type Target = Worker<Task>;
+    fn deref(&self) -> &Worker<Task> {
+        &self.1
+    }
+}
+
+impl Drop for WorkerWrapper {
+    fn drop(&mut self) {
+        let system = System::get();
+        while let Some(task) = self.pop() {
+            task.tag().set_schedule_index_hint(self.0.index);
+            system.push(task);
+        }
     }
 }
