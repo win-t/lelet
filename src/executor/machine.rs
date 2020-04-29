@@ -1,12 +1,9 @@
 use std::cell::RefCell;
-use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::sync::Mutex;
 
 use crossbeam_deque::{Steal, Stealer, Worker};
-use once_cell::sync::Lazy;
 
 #[cfg(feature = "tracing")]
 use log::trace;
@@ -32,7 +29,7 @@ static MACHINE_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 struct Current {
     processor: &'static Processor,
     machine: Arc<Machine>,
-    worker: Rc<WorkerWrapper>,
+    worker: Rc<Worker<Task>>,
 }
 
 thread_local! {
@@ -40,8 +37,8 @@ thread_local! {
 }
 
 impl Machine {
-    fn new() -> (Arc<Machine>, WorkerWrapper) {
-        let worker = WorkerWrapper::new();
+    fn new() -> (Arc<Machine>, Worker<Task>) {
+        let worker = Worker::new_fifo();
         let stealer = worker.stealer();
         let machine = Machine {
             id: MACHINE_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
@@ -55,7 +52,7 @@ impl Machine {
     }
 
     pub fn replace(processor: &'static Processor, current: Option<Arc<Machine>>) -> Arc<Machine> {
-        // just to make sure that the current machine is current processor's machine
+        // just to make sure that current is current processor's machine
         if let Some(current) = current.as_ref() {
             assert!(processor.still_on_machine(current));
         }
@@ -65,27 +62,17 @@ impl Machine {
             let new = new.clone();
             thread_pool::spawn_box(Box::new(move || {
                 abort_on_panic(move || {
-                    // initialize/steal task from current machine
-                    if let Some(current) = current {
-                        loop {
-                            if let Steal::Empty = current.stealer.steal_batch(&worker) {
-                                break;
-                            }
-                        }
-                        drop(current);
-                    }
-
                     let worker = Rc::new(worker);
 
-                    CURRENT_TLS.with(|current| {
-                        current.borrow_mut().replace(Current {
+                    CURRENT_TLS.with(|tls| {
+                        tls.borrow_mut().replace(Current {
                             processor,
                             machine: new.clone(),
                             worker: worker.clone(),
                         })
                     });
                     defer! {
-                      CURRENT_TLS.with(|current| drop(current.borrow_mut().take()));
+                      CURRENT_TLS.with(|tls| drop(tls.borrow_mut().take()));
                     }
 
                     // run processor with new machine
@@ -93,6 +80,7 @@ impl Machine {
                         system: System::get(),
                         machine: &new,
                         worker: &worker,
+                        inherit_tasks: current.map(|m| m.stealer.clone()),
                     });
                 })
             }));
@@ -146,45 +134,5 @@ impl std::fmt::Debug for Machine {
 impl Drop for Machine {
     fn drop(&mut self) {
         trace!("{:?} is destroyed", self);
-    }
-}
-
-/// this wrapper to make sure that no task is discarded
-/// when a machine done with a worker
-/// and cache the unused worker if necessary
-/// because creating worker will allocate some memory
-struct WorkerWrapper(Option<Worker<Task>>);
-
-static WORKER_POOL: Lazy<Mutex<VecDeque<Worker<Task>>>> = Lazy::new(|| Mutex::new(VecDeque::new()));
-
-impl WorkerWrapper {
-    fn new() -> WorkerWrapper {
-        WorkerWrapper(Some(
-            WORKER_POOL
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or_else(Worker::new_fifo),
-        ))
-    }
-}
-
-impl std::ops::Deref for WorkerWrapper {
-    type Target = Worker<Task>;
-    fn deref(&self) -> &Worker<Task> {
-        self.0.as_ref().unwrap()
-    }
-}
-
-impl Drop for WorkerWrapper {
-    fn drop(&mut self) {
-        let system = System::get();
-        while let Some(task) = self.pop() {
-            system.push(task);
-        }
-        WORKER_POOL
-            .lock()
-            .unwrap()
-            .push_back(self.0.take().unwrap());
     }
 }

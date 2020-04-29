@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crossbeam_channel::{bounded, Receiver, Sender};
-use crossbeam_deque::{Injector, Steal, Worker};
+use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use crossbeam_utils::Backoff;
 
 #[cfg(feature = "tracing")]
@@ -32,6 +32,7 @@ pub struct RunContext<'a> {
     pub system: &'a System,
     pub machine: &'a Machine,
     pub worker: &'a Worker<Task>,
+    pub inherit_tasks: Option<Stealer<Task>>,
 }
 
 impl Processor {
@@ -63,6 +64,7 @@ impl Processor {
             system,
             machine,
             worker,
+            inherit_tasks,
             ..
         } = ctx;
 
@@ -74,6 +76,21 @@ impl Processor {
         crate::thread_pool::THREAD_ID.with(|tid| {
             trace!("{:?} is now running on {:?} on {:?}", self, machine, tid);
         });
+
+        macro_rules! ensure_inherit_tasks {
+            () => {
+                if let Some(inherit_tasks) = inherit_tasks.as_ref() {
+                    loop {
+                        if let Steal::Empty = inherit_tasks.steal_batch(&worker) {
+                            break;
+                        }
+                    }
+                }
+            };
+        }
+
+        // inherit tasks from old machine
+        ensure_inherit_tasks!();
 
         // Number of runs in a row before the global queue is inspected.
         const MAX_RUNS: usize = 16;
@@ -90,18 +107,12 @@ impl Processor {
                     #[cfg(feature = "tracing")]
                     let last_task = format!("{:?}", $task.tag());
 
-                    if self.still_on_machine(machine) {
-                        #[cfg(feature = "tracing")]
-                        trace!("{:?} is running on {:?}", $task.tag(), self);
+                    #[cfg(feature = "tracing")]
+                    trace!("{:?} is running on {:?}", $task.tag(), self);
 
-                        // update the tag, so this task will be push to this processor again
-                        $task.tag().set_schedule_index_hint(self.index);
-                        $task.run();
-                    } else {
-                        // there is possibility that (*) is skipped because of race condition,
-                        // put it back in global queue
-                        system.push($task);
-                    }
+                    // update the tag, so this task will be push to this processor again
+                    $task.tag().set_schedule_index_hint(self.index);
+                    $task.run();
 
                     #[cfg(feature = "tracing")]
                     if self.still_on_machine(machine) {
@@ -109,13 +120,10 @@ impl Processor {
                     }
 
                     if !self.still_on_machine(machine) {
-                        // (*) we now running on thread on machine without processor (stealed)
-                        // that mean the task was blocking, MUST exit now
-
-                        #[cfg(feature = "tracing")]
-                        crate::thread_pool::THREAD_ID.with(|tid| {
-                            trace!("{} was blocking on {:?} on {:?}", last_task, machine, tid);
-                        });
+                        // we now running on thread on machine without processor (stolen)
+                        // that mean the task was blocking, MUST exit now.
+                        // there is possibility that this check is skipped because race condition
+                        // but that is okay, eventually old machine will go here
 
                         return;
                     }
@@ -127,6 +135,10 @@ impl Processor {
 
             macro_rules! get_tasks {
                 () => {
+                    // also check old machine worker, in case old machine still pusing task
+                    // to its worker
+                    ensure_inherit_tasks!();
+
                     run_counter = 0;
                     let _ = self.injector_notif_recv.try_recv(); // flush the notification channel
                     if let Some(task) = system.pop(self.index, worker) {

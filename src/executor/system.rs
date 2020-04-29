@@ -32,7 +32,7 @@ pub struct System {
     /// machine[i] is currently running processor[i]
     machines: Vec<Arc<Machine>>,
 
-    /// used to select which machine to be stealed first
+    /// used to select which machine to be stole first
     machine_steal_index_hint: AtomicUsize,
 
     /// for blocking detection
