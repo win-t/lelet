@@ -1,9 +1,11 @@
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crossbeam_deque::{Steal, Stealer, Worker};
+
+#[cfg(feature = "tracing")]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(feature = "tracing")]
 use log::trace;
@@ -11,103 +13,120 @@ use log::trace;
 use crate::thread_pool;
 use crate::utils::abort_on_panic;
 
-use super::processor::{Processor, RunContext};
+use super::processor::Processor;
 use super::system::System;
 use super::Task;
 
+#[cfg(feature = "tracing")]
+static MACHINE_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
 /// Machine is the one who have OS thread
 pub struct Machine {
-    pub id: usize,
+    #[cfg(feature = "tracing")]
+    id: usize,
 
     /// stealer for the machine, Worker part is not here,
-    /// and moved via closure, because Worker is !Sync
+    /// it is stored on thread tls, because Worker is !Sync
     stealer: Stealer<Task>,
 }
 
-static MACHINE_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
 struct Current {
-    machine: Arc<Machine>,
-    wrapper: Rc<WorkerWrapper>,
+    live: Option<(Arc<Machine>, &'static Processor)>,
+    worker: Rc<Worker<Task>>,
 }
 
 thread_local! {
-  static CURRENT_TLS: RefCell<Option<Current>> = RefCell::new(None);
+  static CURRENT: RefCell<Option<Current>> = RefCell::new(None);
 }
 
 impl Machine {
-    fn new(processor: &'static Processor) -> (Arc<Machine>, WorkerWrapper) {
-        let worker = WorkerWrapper::new(processor);
-        let stealer = worker.stealer();
+    fn new(worker: &Worker<Task>) -> Machine {
+        #[allow(clippy::let_and_return)]
         let machine = Machine {
+            #[cfg(feature = "tracing")]
             id: MACHINE_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
-            stealer,
+
+            stealer: worker.stealer(),
         };
 
         #[cfg(feature = "tracing")]
         trace!("{:?} is created", machine);
 
-        (Arc::new(machine), worker)
+        machine
     }
 
-    pub fn replace(processor: &'static Processor, current: Option<Arc<Machine>>) -> Arc<Machine> {
-        // just to make sure that current is current processor's machine
-        if let Some(current) = current.as_ref() {
-            assert!(processor.still_on_machine(current));
-        }
-
-        let (new, worker) = Machine::new(processor);
-        {
-            let new = new.clone();
-            thread_pool::spawn_box(Box::new(move || {
-                abort_on_panic(move || {
-                    let worker = Rc::new(worker);
-
-                    CURRENT_TLS.with(|tls| {
-                        tls.borrow_mut().replace(Current {
-                            machine: new.clone(),
-                            wrapper: worker.clone(),
-                        })
-                    });
-                    defer! {
-                      CURRENT_TLS.with(|tls| drop(tls.borrow_mut().take()));
+    pub fn spawn(processor: &'static Processor) {
+        thread_pool::spawn_box(Box::new(move || {
+            abort_on_panic(move || {
+                CURRENT.with(|current| {
+                    if current.borrow().is_none() {
+                        current.borrow_mut().replace(Current {
+                            worker: Rc::new(Worker::new_fifo()),
+                            live: None,
+                        });
                     }
 
-                    // run processor with new machine
-                    processor.run(&RunContext {
-                        system: System::get(),
-                        machine: &new,
-                        worker: &worker,
-                        inherit_tasks: current.map(|m| m.stealer.clone()),
-                    });
-                })
-            }));
-        }
+                    let worker = current.borrow().as_ref().unwrap().worker.clone();
+                    let machine = Arc::new(Machine::new(&worker));
 
-        new
+                    // set current live machine
+                    current
+                        .borrow_mut()
+                        .as_mut()
+                        .unwrap()
+                        .live
+                        .replace((machine.clone(), processor));
+
+                    defer! {
+                        // take out the current live machine
+                        current
+                            .borrow_mut()
+                            .as_mut()
+                            .unwrap()
+                            .live
+                            .take();
+                    }
+
+                    let system = System::get();
+
+                    defer! {
+                        // clean up all task in worker to make sure
+                        // there is no task is stalled
+                        while let Some(task) = worker.pop() {
+                            task.tag().set_schedule_index_hint(processor.index);
+                            system.push(task);
+                        }
+                    }
+
+                    processor.run_on(system, machine, &worker);
+                });
+            })
+        }));
     }
 
     pub fn direct_push(task: Task) -> Result<(), Task> {
-        CURRENT_TLS.with(|tls| match tls.borrow().as_ref() {
-            Some(Current { machine, wrapper }) => {
-                let processor = wrapper.0;
-                let worker = &wrapper.1;
-                if processor.still_on_machine(machine) {
-                    #[cfg(feature = "tracing")]
-                    trace!(
-                        "{:?} pushed directly to {:?}'s machine",
-                        task.tag(),
-                        processor,
-                    );
+        CURRENT.with(|current| match current.borrow().as_ref() {
+            Some(Current {
+                live: Some((machine, processor)),
+                worker,
+            }) if processor.still_on_machine(machine) => {
+                #[cfg(feature = "tracing")]
+                trace!(
+                    "{:?} pushed directly to {:?}'s machine",
+                    task.tag(),
+                    processor,
+                );
 
-                    worker.push(task);
-                    Ok(())
-                } else {
-                    Err(task)
-                }
+                worker.push(task);
+                Ok(())
             }
-            None => Err(task),
+            _ => Err(task),
         })
+    }
+
+    #[inline(always)]
+    pub fn eq(&self, other: &Machine) -> bool {
+        std::ptr::eq(self, other)
     }
 
     pub fn steal(&self, worker: &Worker<Task>) -> Option<Task> {
@@ -120,6 +139,11 @@ impl Machine {
                 Steal::Retry => unreachable!(), // already filtered
             })
             .flatten()
+    }
+
+    pub fn steal_all(&self, worker: &Worker<Task>) {
+        // repeat until empty
+        std::iter::repeat_with(|| self.stealer.steal_batch(worker)).find(|s| s.is_empty());
     }
 }
 
@@ -134,32 +158,5 @@ impl std::fmt::Debug for Machine {
 impl Drop for Machine {
     fn drop(&mut self) {
         trace!("{:?} is destroyed", self);
-    }
-}
-
-/// this wrapper to make sure that no task is discarded
-/// when a machine done with a worker
-struct WorkerWrapper(&'static Processor, Worker<Task>);
-
-impl WorkerWrapper {
-    fn new(p: &'static Processor) -> WorkerWrapper {
-        WorkerWrapper(p, Worker::new_fifo())
-    }
-}
-
-impl std::ops::Deref for WorkerWrapper {
-    type Target = Worker<Task>;
-    fn deref(&self) -> &Worker<Task> {
-        &self.1
-    }
-}
-
-impl Drop for WorkerWrapper {
-    fn drop(&mut self) {
-        let system = System::get();
-        while let Some(task) = self.pop() {
-            task.tag().set_schedule_index_hint(self.0.index);
-            system.push(task);
-        }
     }
 }

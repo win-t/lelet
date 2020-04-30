@@ -1,19 +1,20 @@
 // extra doc:
 // Inspired by golang runtime, see https://golang.org/s/go11sched
-// so understand some terminology like machine and processor will help you
+// understanding some terminology like machine and processor will help you
 // understand this code.
 //
 // Noticable difference with golang scheduler
-// 0. we called it task instead of goroutine (obviously)
-//    we called local queue as worker (derived from crossbeam-deque)
-//    we called global queue as injector (derived from crossbeam-deque)
-// 1. local queue is attached to machine instead of processor
-// 2. each processor have dedicated global queue, when processor need more task
-//    from global queue it prioritized dedicated global queue over others global queue
-// 3. machine steal processor from others instead of acquire/release from global list
-// 4. when a task is running on thread on machine without processor (stolen by other machine),
-//    it mean that task was blocking and the machine MUST die after the task is done,
-//    machine don't live without a processor
+// 0. we called goroutine as task (obviously)
+//    we called local queue as worker (from crossbeam-deque)
+//    we called global queue as injector (from crossbeam-deque)
+// 1. worker (local queue) is attached to each machine's thread TLS instead of processor
+//    because worker is !Sync
+// 2. each processor have dedicated injector (global queue), when processor need more task,
+//    it prioritized the dedicated one over others
+// 3. new machine steal the processor from old one when it run the processor instead of
+//    acquire/release from global list
+// 4. machine don't live without a processor (when stolen by new machine),
+//    it must exit as soon as possible
 
 mod machine;
 mod processor;
