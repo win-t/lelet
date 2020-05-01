@@ -31,7 +31,7 @@ pub struct Machine {
 }
 
 struct Current {
-    live: Option<(Arc<Machine>, &'static Processor)>,
+    live: Option<(&'static System, Arc<Machine>, &'static Processor)>,
     worker: Rc<Worker<Task>>,
 }
 
@@ -66,16 +66,16 @@ impl Machine {
                         });
                     }
 
+                    let system = System::get();
                     let worker = current.borrow().as_ref().unwrap().worker.clone();
                     let machine = Arc::new(Machine::new(&worker));
 
                     // set current live machine
-                    current
-                        .borrow_mut()
-                        .as_mut()
-                        .unwrap()
-                        .live
-                        .replace((machine.clone(), processor));
+                    current.borrow_mut().as_mut().unwrap().live.replace((
+                        system,
+                        machine.clone(),
+                        processor,
+                    ));
 
                     defer! {
                         // take out the current live machine
@@ -86,8 +86,6 @@ impl Machine {
                             .live
                             .take();
                     }
-
-                    let system = System::get();
 
                     defer! {
                         // clean up all task in worker to make sure
@@ -107,7 +105,7 @@ impl Machine {
     pub fn direct_push(task: Task) -> Result<(), Task> {
         CURRENT.with(|current| match current.borrow().as_ref() {
             Some(Current {
-                live: Some((machine, processor)),
+                live: Some((system, machine, processor)),
                 worker,
             }) if processor.still_on_machine(machine) => {
                 #[cfg(feature = "tracing")]
@@ -118,6 +116,8 @@ impl Machine {
                 );
 
                 worker.push(task);
+                system.processors_wake_up();
+
                 Ok(())
             }
             _ => Err(task),

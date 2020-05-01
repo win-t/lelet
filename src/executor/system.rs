@@ -137,12 +137,13 @@ impl System {
                 );
             }
 
-            if !self.processors[index].push_then_wake_up(task) {
-                // cannot send wake up signal (processor is busy), wake up others
-                let (l, r) = self.processors.split_at(index + 1);
-                r.iter().chain(l.iter()).find(|p| p.wake_up());
-            }
+            self.processors[index].push(task);
+            self.processors_wake_up();
         }
+    }
+
+    pub fn processors_wake_up(&self) {
+        self.processors.iter().for_each(|p| p.wake_up());
     }
 
     pub fn pop(&self, index: usize, worker: &Worker<Task>) -> Option<Task> {

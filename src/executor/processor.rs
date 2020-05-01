@@ -222,14 +222,6 @@ impl Processor {
 
     fn sleep(&self, system: &System, backoff: &Backoff) {
         if backoff.is_completed() {
-            #[cfg(feature = "tracing")]
-            trace!("{:?} entering sleep", self);
-
-            #[cfg(feature = "tracing")]
-            defer! {
-              trace!("{:?} leaving sleep", self);
-            }
-
             self.last_seen.store(u64::MAX, Ordering::Relaxed);
             self.injector_notif_recv.recv().unwrap();
             self.last_seen.store(system.now(), Ordering::Relaxed);
@@ -249,20 +241,16 @@ impl Processor {
         self.last_seen.load(Ordering::Relaxed)
     }
 
-    /// return true if wake up signal is delivered
     #[inline(always)]
-    pub fn wake_up(&self) -> bool {
-        self.injector_notif.try_send(()).is_ok()
+    pub fn wake_up(&self) {
+        let _ = self.injector_notif.try_send(());
     }
 
-    /// return true if wake up signal is delivered
-    pub fn push_then_wake_up(&self, task: Task) -> bool {
+    pub fn push(&self, task: Task) {
         #[cfg(feature = "tracing")]
         trace!("{:?} pushed to {:?}", task.tag(), self);
 
         self.injector.push(task);
-
-        self.wake_up()
     }
 
     pub fn pop(&self, worker: &Worker<Task>) -> Option<Task> {

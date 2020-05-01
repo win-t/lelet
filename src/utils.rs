@@ -23,7 +23,7 @@ pub fn abort_on_panic(f: impl FnOnce()) {
 macro_rules! defer {
   ($($body:tt)*) => {
       let _guard = {
-          pub struct Guard<F: FnOnce()>(Option<F>);
+          struct Guard<F: FnOnce()>(Option<F>);
 
           impl<F: FnOnce()> Drop for Guard<F> {
               fn drop(&mut self) {
