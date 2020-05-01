@@ -14,9 +14,6 @@ use log::trace;
 const IDLE_THRESHOLD: Duration = Duration::from_secs(60);
 
 #[cfg(feature = "tracing")]
-static THREAD_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-#[cfg(feature = "tracing")]
 pub struct ThreadID(Cell<usize>);
 
 #[cfg(feature = "tracing")]
@@ -41,16 +38,6 @@ struct Pool {
     receiver: Receiver<Job>,
 }
 
-static POOL: Lazy<Pool> = Lazy::new(|| {
-    let (sender, receiver) = bounded(0);
-    Pool {
-        base: Instant::now(),
-        next_exit: AtomicUsize::new(0),
-        sender,
-        receiver,
-    }
-});
-
 impl Pool {
     fn put_job(&'static self, job: Job) {
         self.sender.try_send(job).unwrap_or_else(|err| match err {
@@ -66,6 +53,7 @@ impl Pool {
     fn main(&self, receiver: Receiver<Job>) {
         #[cfg(feature = "tracing")]
         THREAD_ID.with(|id| {
+            static THREAD_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
             id.0.set(THREAD_ID_COUNTER.fetch_add(1, Ordering::Relaxed));
             trace!("{:?} is created", id);
         });
@@ -94,7 +82,7 @@ impl Pool {
 
                         // only 1 thread is allowed to exit per IDLE_THRESHOLD
                         // ensure it via CAS
-                        if POOL.next_exit.compare_and_swap(
+                        if self.next_exit.compare_and_swap(
                             next_exit,
                             new_next_exit,
                             Ordering::Relaxed,
@@ -116,5 +104,15 @@ impl Pool {
 
 #[inline(always)]
 pub fn spawn_box(job: Job) {
+    static POOL: Lazy<Pool> = Lazy::new(|| {
+        let (sender, receiver) = bounded(0);
+        Pool {
+            base: Instant::now(),
+            next_exit: AtomicUsize::new(0),
+            sender,
+            receiver,
+        }
+    });
+
     POOL.put_job(job);
 }

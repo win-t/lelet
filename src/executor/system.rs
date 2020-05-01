@@ -44,48 +44,48 @@ impl Drop for System {
     }
 }
 
-static SYSTEM: Lazy<&'static System> = Lazy::new(|| {
-    #[cfg(feature = "tracing")]
-    trace!("Creating system");
-
-    let num_cpus = std::cmp::max(1, num_cpus::get());
-
-    // channel with buffer size 1 to not miss a notification
-    let (sysmon_notif, sysmon_notif_recv) = bounded(1);
-
-    let mut processors = Vec::new();
-    for index in 0..num_cpus {
-        processors.push(Processor::new(index));
-    }
-
-    // just to make sure that processor index is consistent
-    (0..num_cpus)
-        .zip(processors.iter())
-        .for_each(|(index, processor)| {
-            assert_eq!(processor.index, index);
-        });
-
-    let system = System {
-        num_cpus,
-        processors,
-
-        processor_push_index_hint: AtomicUsize::new(0),
-        steal_index_hint: AtomicUsize::new(0),
-
-        tick: AtomicU64::new(0),
-
-        sysmon_notif,
-        sysmon_notif_recv,
-    };
-
-    thread::spawn(move || abort_on_panic(move || SYSTEM.sysmon_main()));
-
-    // alocate on heap and leak it to make sure it has 'static lifetime
-    unsafe { &*Box::into_raw(Box::new(system)) }
-});
-
 impl System {
     pub fn get() -> &'static System {
+        static SYSTEM: Lazy<&'static System> = Lazy::new(|| {
+            #[cfg(feature = "tracing")]
+            trace!("Creating system");
+
+            let num_cpus = std::cmp::max(1, num_cpus::get());
+
+            // channel with buffer size 1 to not miss a notification
+            let (sysmon_notif, sysmon_notif_recv) = bounded(1);
+
+            let mut processors = Vec::new();
+            for index in 0..num_cpus {
+                processors.push(Processor::new(index));
+            }
+
+            // just to make sure that processor index is consistent
+            (0..num_cpus)
+                .zip(processors.iter())
+                .for_each(|(index, processor)| {
+                    assert_eq!(processor.index, index);
+                });
+
+            let system = System {
+                num_cpus,
+                processors,
+
+                processor_push_index_hint: AtomicUsize::new(0),
+                steal_index_hint: AtomicUsize::new(0),
+
+                tick: AtomicU64::new(0),
+
+                sysmon_notif,
+                sysmon_notif_recv,
+            };
+
+            thread::spawn(move || abort_on_panic(move || System::get().sysmon_main()));
+
+            // alocate on heap and leak it to make sure it has 'static lifetime
+            unsafe { &*Box::into_raw(Box::new(system)) }
+        });
+
         &SYSTEM
     }
 
@@ -98,15 +98,18 @@ impl System {
 
             thread::sleep(BLOCKING_THRESHOLD);
 
-            self.processors
+            let processors = self
+                .processors
                 .iter()
-                .filter(|p| p.get_last_seen() < check_tick)
-                .map(|p| {
-                    #[cfg(feature = "tracing")]
-                    trace!("{:?} was blocked, replacing its machine", p);
-                    p
-                })
-                .for_each(Machine::spawn);
+                .filter(|p| p.get_last_seen() < check_tick);
+
+            #[cfg(feature = "tracing")]
+            let processors = processors.map(|p| {
+                trace!("{:?} was blocked, replacing its machine", p);
+                p
+            });
+
+            processors.for_each(Machine::spawn);
 
             if self
                 .processors

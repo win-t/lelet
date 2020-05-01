@@ -37,14 +37,13 @@
 //! thread::sleep(Duration::from_secs(11));
 //! ```
 
+#[doc(hidden)]
 #[macro_use]
-mod utils;
-
-mod executor;
-mod thread_pool;
-
-pub use executor::spawn;
-pub use executor::JoinHandle;
+pub mod utils;
 
 #[doc(hidden)]
-pub use utils::yield_now;
+pub mod thread_pool;
+
+mod executor;
+pub use executor::spawn;
+pub use executor::JoinHandle;

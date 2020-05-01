@@ -143,10 +143,10 @@ impl Processor {
                         // this check, but before next run), but that is okay,
                         // eventually old machine thread will go here
 
-                        // remove old machine from zombie list
+                        // remove current dead machine from zombie list
                         self.zombie_machines
                             .lock()
-                            .retain(|old_machine| !old_machine.eq(machine));
+                            .retain(|zombie| !zombie.eq(machine));
 
                         return;
                     }

@@ -3,9 +3,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(feature = "tracing")]
 use log::trace;
 
-#[cfg(feature = "tracing")]
-static TASK_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
 pub struct TaskTag {
     #[cfg(feature = "tracing")]
     id: usize,
@@ -15,6 +12,9 @@ pub struct TaskTag {
 
 impl TaskTag {
     pub fn new() -> TaskTag {
+        #[cfg(feature = "tracing")]
+        static TASK_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
         #[allow(clippy::let_and_return)]
         let tag = TaskTag {
             #[cfg(feature = "tracing")]

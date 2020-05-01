@@ -17,9 +17,6 @@ use super::processor::Processor;
 use super::system::System;
 use super::Task;
 
-#[cfg(feature = "tracing")]
-static MACHINE_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
 /// Machine is the one who have OS thread
 pub struct Machine {
     #[cfg(feature = "tracing")]
@@ -41,6 +38,9 @@ thread_local! {
 
 impl Machine {
     fn new(worker: &Worker<Task>) -> Machine {
+        #[cfg(feature = "tracing")]
+        static MACHINE_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
         #[allow(clippy::let_and_return)]
         let machine = Machine {
             #[cfg(feature = "tracing")]

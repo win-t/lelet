@@ -38,7 +38,13 @@ macro_rules! defer {
   };
 }
 
-struct Yields(usize);
+pub struct Yields(usize);
+
+impl Yields {
+    pub fn new(times: usize) -> Yields {
+        Yields(times)
+    }
+}
 
 impl Future for Yields {
     type Output = ();
@@ -60,7 +66,10 @@ pub async fn yield_now() {
 
 /// A simple spinlock.
 ///
-/// copied from crossbeam_channel::utils
+/// copied from [`crossbeam_channel`]`::utils`
+/// because it is private in that crate
+///
+/// [`crossbeam_channel`]: https://docs.rs/crossbeam-channel
 pub struct Spinlock<T> {
     flag: AtomicBool,
     value: UnsafeCell<T>,
@@ -87,6 +96,7 @@ impl<T> Spinlock<T> {
     }
 }
 
+/// A guard holding a spinlock locked.
 pub struct SpinlockGuard<'a, T: 'a> {
     parent: &'a Spinlock<T>,
 }
