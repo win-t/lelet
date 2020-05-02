@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::ptr;
+use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
@@ -24,7 +25,7 @@ pub struct Processor {
     last_seen: AtomicU64,
 
     /// current machine that holding the processor
-    current_machine: Option<Arc<Machine>>,
+    current_machine: AtomicPtr<Machine>,
 
     /// machines that holding the processor in the past, but still alive
     zombie_machines: Spinlock<VecDeque<Arc<Machine>>>,
@@ -33,6 +34,13 @@ pub struct Processor {
     injector: Injector<Task>,
     injector_notif: Sender<()>,
     injector_notif_recv: Receiver<()>,
+}
+
+impl Drop for Processor {
+    fn drop(&mut self) {
+        eprintln!("Processor should not be dropped once created");
+        std::process::abort();
+    }
 }
 
 impl Processor {
@@ -46,7 +54,7 @@ impl Processor {
 
             last_seen: AtomicU64::new(0),
 
-            current_machine: None,
+            current_machine: AtomicPtr::new(ptr::null_mut()),
             zombie_machines: Spinlock::new(VecDeque::with_capacity(1)),
 
             injector: Injector::new(),
@@ -60,42 +68,6 @@ impl Processor {
         processor
     }
 
-    fn swap_machine(&self, new: Arc<Machine>) -> Option<Arc<Machine>> {
-        use std::mem::transmute;
-        use std::sync::atomic::AtomicPtr;
-
-        let output = Some(new);
-
-        // force atomic swap self.current_machine,
-        // this is safe because Option<Arc<Machine>> have same size
-        // with AtomicPtr<()>, because they ARE pointer
-        unsafe {
-            if false {
-                // just to make sure at compile time
-                // https://internals.rust-lang.org/t/compile-time-assert/6751/2
-                // do not run this code, this code will surely crash the program
-                transmute::<AtomicPtr<()>, Option<Arc<Machine>>>(AtomicPtr::default());
-            }
-
-            let backoff = Backoff::new();
-            loop {
-                let current = &self.current_machine;
-                let current = &*(current as *const Option<Arc<Machine>> as *const AtomicPtr<()>);
-                let output = &*(&output as *const Option<Arc<Machine>> as *const AtomicPtr<()>);
-                let tmp = current.load(Ordering::Relaxed);
-                if current.compare_and_swap(tmp, output.load(Ordering::Relaxed), Ordering::Relaxed)
-                    == tmp
-                {
-                    output.store(tmp, Ordering::Relaxed);
-                    break;
-                }
-                backoff.snooze();
-            }
-        }
-
-        output
-    }
-
     pub fn run_on(&self, system: &System, machine: Arc<Machine>, worker: &Worker<Task>) {
         // steal this processor from old machine and add old machine to zombie list
         if let Some(old_machine) = self.swap_machine(machine) {
@@ -104,7 +76,7 @@ impl Processor {
 
         self.last_seen.store(system.now(), Ordering::Relaxed);
 
-        let machine = &self.current_machine.as_ref().unwrap() as &Machine;
+        let machine = self.get_current_machine().unwrap();
 
         #[cfg(feature = "tracing")]
         crate::thread_pool::THREAD_ID.with(|tid| {
@@ -120,57 +92,36 @@ impl Processor {
 
         let sleep_backoff = Backoff::new();
 
-        'main: loop {
-            // mark this processor on every iteration
-            self.last_seen.store(system.now(), Ordering::Relaxed);
-
+        while self.still_on_machine(machine) {
             macro_rules! run_task {
                 ($task:ident) => {
                     #[cfg(feature = "tracing")]
                     trace!("{:?} is going to run on {:?}", $task.tag(), self);
 
-                    // also mark this processor before running task
-                    self.last_seen.store(system.now(), Ordering::Relaxed);
-
-                    // update the tag, so this task will be push to this processor again
                     $task.tag().set_schedule_index_hint(self.index);
                     $task.run();
-
-                    if !self.still_on_machine(machine) {
-                        // we now running on thread on machine without processor (stolen)
-                        // that mean the task was blocking, MUST exit now.
-                        // but, there is possibility of race condition (new machine take over after
-                        // this check, but before next run), but that is okay,
-                        // eventually old machine thread will go here
-
-                        // remove current dead machine from zombie list
-                        self.zombie_machines
-                            .lock()
-                            .retain(|zombie| !zombie.eq(machine));
-
-                        return;
-                    }
-
                     run_counter += 1;
-                    continue 'main;
+
+                    continue;
                 };
             }
 
             macro_rules! run_global_task {
                 () => {
-                    // also check zombie, in case zombie still pushing
-                    // task directly to its worker
-                    self.inherit_zombies(worker);
-                    if let Some(task) = worker.pop() {
-                        run_task!(task);
-                    }
-
                     run_counter = 0;
+
+                    // also check zombie, in case zombie still pushing
+                    // task directly to its worker, see also ack_zombie
+                    self.inherit_zombies(worker);
+
                     if let Some(task) = system.pop(self.index, worker) {
                         run_task!(task);
                     }
                 };
             }
+
+            // mark this processor on every iteration
+            self.last_seen.store(system.now(), Ordering::Relaxed);
 
             if run_counter >= MAX_RUNS {
                 run_global_task!();
@@ -199,25 +150,48 @@ impl Processor {
         }
     }
 
+    fn swap_machine(&self, machine: Arc<Machine>) -> Option<Arc<Machine>> {
+        let mut machine = Arc::into_raw(machine) as *mut _;
+        machine = self.current_machine.swap(machine, Ordering::Relaxed);
+        if machine.is_null() {
+            None
+        } else {
+            Some(unsafe { Arc::from_raw(machine) })
+        }
+    }
+
+    #[inline(always)]
+    pub fn get_current_machine(&self) -> Option<&Machine> {
+        let current_machine = self.current_machine.load(Ordering::Relaxed);
+        if current_machine.is_null() {
+            None
+        } else {
+            Some(unsafe { &*current_machine })
+        }
+    }
+
     #[inline(always)]
     pub fn still_on_machine(&self, machine: &Machine) -> bool {
-        self.current_machine
-            .as_ref()
-            .map(|current_machine| current_machine.eq(machine))
+        self.get_current_machine()
+            .map(|current_machine| ptr::eq(current_machine, machine))
             .unwrap_or(false)
     }
 
-    #[inline(always)]
-    pub fn get_machine(&self) -> &Option<Arc<Machine>> {
-        &self.current_machine
-    }
-
-    #[inline(always)]
     fn inherit_zombies(&self, worker: &Worker<Task>) {
         self.zombie_machines
             .lock()
             .iter()
             .for_each(|zombie| zombie.steal_all(worker));
+    }
+
+    /// this is a promise that machine will not push
+    /// to its worker anymore
+    /// so we can safely remove machine from zombie list,
+    /// and no task is stalled on machine worker
+    pub fn ack_zombie(&self, machine: &Machine) {
+        self.zombie_machines
+            .lock()
+            .retain(|zombie| !ptr::eq(zombie as &Machine, machine));
     }
 
     fn sleep(&self, system: &System, backoff: &Backoff) {
@@ -241,7 +215,6 @@ impl Processor {
         self.last_seen.load(Ordering::Relaxed)
     }
 
-    #[inline(always)]
     pub fn wake_up(&self) {
         let _ = self.injector_notif.try_send(());
     }

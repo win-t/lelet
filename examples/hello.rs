@@ -7,8 +7,6 @@ fn main() {
     #[cfg(feature = "tracing")]
     simple_logger::init().unwrap();
 
-    let a = crossbeam_channel::utils::Spinlock::new(10);
-
     lelet::spawn(async {
         for _ in 0..10 {
             Delay::new(Duration::from_secs(1)).await;

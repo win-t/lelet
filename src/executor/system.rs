@@ -18,7 +18,6 @@ use super::Task;
 /// how long a processor considered to be blocking
 const BLOCKING_THRESHOLD: Duration = Duration::from_millis(10);
 
-// singleton: SYSTEM
 pub struct System {
     num_cpus: usize,
 
@@ -164,7 +163,7 @@ impl System {
         let m = self.steal_index_hint.load(Ordering::Relaxed);
         let (l, r) = self.processors.split_at(m);
         (1..)
-            .zip(r.iter().chain(l.iter()).map(|p| p.get_machine().as_ref()))
+            .zip(r.iter().chain(l.iter()).map(|p| p.get_current_machine()))
             .filter(|(_, m)| m.is_some())
             .map(|(hint_add, m)| (hint_add, m.unwrap().steal(worker)))
             .find(|(_, s)| s.is_some())

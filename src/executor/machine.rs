@@ -1,5 +1,4 @@
 use std::cell::RefCell;
-use std::rc::Rc;
 use std::sync::Arc;
 
 use crossbeam_deque::{Steal, Stealer, Worker};
@@ -28,12 +27,62 @@ pub struct Machine {
 }
 
 struct Current {
-    live: Option<(&'static System, Arc<Machine>, &'static Processor)>,
-    worker: Rc<Worker<Task>>,
+    active: Option<(&'static System, Arc<Machine>, &'static Processor)>,
+    worker: Worker<Task>,
+}
+
+impl Current {
+    fn new() -> Current {
+        Current {
+            active: None,
+            worker: Worker::new_fifo(),
+        }
+    }
+
+    fn init(&mut self, processor: &'static Processor) {
+        self.clean_up();
+        self.active.replace((
+            System::get(),
+            Arc::new(Machine::new(&self.worker)),
+            processor,
+        ));
+    }
+
+    fn clean_up(&mut self) {
+        if let Some((system, machine, processor)) = self.active.take() {
+            // clean up all task in worker
+            while let Some(task) = self.worker.pop() {
+                task.tag().set_schedule_index_hint(processor.index);
+                system.push(task);
+            }
+
+            processor.ack_zombie(&machine);
+        }
+    }
+
+    fn still_valid(&self) -> bool {
+        self.active
+            .as_ref()
+            .map(|(_, machine, processor)| processor.still_on_machine(machine))
+            .unwrap_or(false)
+    }
+
+    fn push(&self, task: Task) {
+        if let Some((system, _, _)) = self.active.as_ref() {
+            self.worker.push(task);
+            system.processors_wake_up();
+        }
+    }
+
+    fn run(&self) {
+        if let Some((system, machine, processor)) = self.active.as_ref() {
+            processor.run_on(system, machine.clone(), &self.worker);
+        }
+    }
 }
 
 thread_local! {
-  static CURRENT: RefCell<Option<Current>> = RefCell::new(None);
+    static CACHE: RefCell<Option<Current>> = RefCell::new(None);
 }
 
 impl Machine {
@@ -58,75 +107,35 @@ impl Machine {
     pub fn spawn(processor: &'static Processor) {
         thread_pool::spawn_box(Box::new(move || {
             abort_on_panic(move || {
-                CURRENT.with(|current| {
-                    if current.borrow().is_none() {
-                        current.borrow_mut().replace(Current {
-                            worker: Rc::new(Worker::new_fifo()),
-                            live: None,
-                        });
+                CACHE.with(|cache| {
+                    if cache.borrow().is_none() {
+                        cache.borrow_mut().replace(Current::new());
                     }
 
-                    let system = System::get();
-                    let worker = current.borrow().as_ref().unwrap().worker.clone();
-                    let machine = Arc::new(Machine::new(&worker));
-
-                    // set current live machine
-                    current.borrow_mut().as_mut().unwrap().live.replace((
-                        system,
-                        machine.clone(),
-                        processor,
-                    ));
-
+                    cache.borrow_mut().as_mut().unwrap().init(processor);
                     defer! {
-                        // take out the current live machine
-                        current
-                            .borrow_mut()
-                            .as_mut()
-                            .unwrap()
-                            .live
-                            .take();
+                        cache.borrow_mut().as_mut().unwrap().clean_up();
                     }
 
-                    defer! {
-                        // clean up all task in worker to make sure
-                        // there is no task is stalled
-                        while let Some(task) = worker.pop() {
-                            task.tag().set_schedule_index_hint(processor.index);
-                            system.push(task);
-                        }
-                    }
-
-                    processor.run_on(system, machine, &worker);
+                    cache.borrow().as_ref().unwrap().run();
                 });
             })
         }));
     }
 
     pub fn direct_push(task: Task) -> Result<(), Task> {
-        CURRENT.with(|current| match current.borrow().as_ref() {
-            Some(Current {
-                live: Some((system, machine, processor)),
-                worker,
-            }) if processor.still_on_machine(machine) => {
-                #[cfg(feature = "tracing")]
-                trace!(
-                    "{:?} pushed directly to {:?}'s machine",
-                    task.tag(),
-                    processor,
-                );
-
-                worker.push(task);
-                system.processors_wake_up();
-
-                Ok(())
+        CACHE.with(|cache| match cache.borrow_mut().as_mut() {
+            Some(current) => {
+                if current.still_valid() {
+                    current.push(task);
+                    Ok(())
+                } else {
+                    current.clean_up();
+                    Err(task)
+                }
             }
-            _ => Err(task),
+            None => Err(task),
         })
-    }
-
-    #[inline(always)]
-    pub fn eq(&self, other: &Machine) -> bool {
-        std::ptr::eq(self, other)
     }
 
     pub fn steal(&self, worker: &Worker<Task>) -> Option<Task> {

@@ -102,7 +102,6 @@ impl Pool {
     }
 }
 
-#[inline(always)]
 pub fn spawn_box(job: Job) {
     static POOL: Lazy<Pool> = Lazy::new(|| {
         let (sender, receiver) = bounded(0);
