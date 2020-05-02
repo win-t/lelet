@@ -36,6 +36,7 @@ pub struct Processor {
     injector_notif_recv: Receiver<()>,
 }
 
+// just to make sure
 impl Drop for Processor {
     fn drop(&mut self) {
         eprintln!("Processor should not be dropped once created");
@@ -115,6 +116,12 @@ impl Processor {
                     self.inherit_zombies(worker);
 
                     if let Some(task) = system.pop(self.index, worker) {
+                        run_task!(task);
+                    }
+
+                    // in case we got nothing from global queue, but something
+                    // from zombies
+                    if let Some(task) = worker.pop() {
                         run_task!(task);
                     }
                 };
