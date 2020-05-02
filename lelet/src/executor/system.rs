@@ -9,7 +9,7 @@ use once_cell::sync::Lazy;
 #[cfg(feature = "tracing")]
 use log::trace;
 
-use crate::utils::abort_on_panic;
+use lelet_utils::abort_on_panic;
 
 use super::machine::Machine;
 use super::processor::Processor;

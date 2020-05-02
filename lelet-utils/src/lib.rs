@@ -20,6 +20,7 @@ pub fn abort_on_panic(f: impl FnOnce()) {
     std::mem::forget(bomb);
 }
 
+#[macro_export]
 macro_rules! defer {
   ($($body:tt)*) => {
       let _guard = {

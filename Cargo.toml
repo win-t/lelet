@@ -3,4 +3,5 @@
 members = [
     "lelet",
     "lelet-io",
+    "lelet-utils",
 ]

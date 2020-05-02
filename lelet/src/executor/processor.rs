@@ -10,7 +10,7 @@ use crossbeam_utils::Backoff;
 #[cfg(feature = "tracing")]
 use log::trace;
 
-use crate::utils::Spinlock;
+use lelet_utils::Spinlock;
 
 use super::machine::Machine;
 use super::system::System;

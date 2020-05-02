@@ -9,8 +9,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(feature = "tracing")]
 use log::trace;
 
+use lelet_utils::abort_on_panic;
+use lelet_utils::defer;
+
 use crate::thread_pool;
-use crate::utils::abort_on_panic;
 
 use super::processor::Processor;
 use super::system::System;

@@ -38,10 +38,6 @@
 //! ```
 
 #[doc(hidden)]
-#[macro_use]
-pub mod utils;
-
-#[doc(hidden)]
 pub mod thread_pool;
 
 mod executor;
