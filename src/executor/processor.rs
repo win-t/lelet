@@ -32,8 +32,9 @@ pub struct Processor {
 
     /// global queue dedicated to this processor
     injector: Injector<Task>,
-    injector_notif: Sender<()>,
-    injector_notif_recv: Receiver<()>,
+
+    wake_up_notif_sender: Sender<()>,
+    wake_up_notif_receiver: Receiver<()>,
 }
 
 // just to make sure
@@ -47,7 +48,7 @@ impl Drop for Processor {
 impl Processor {
     pub fn new(index: usize) -> Processor {
         // channel with buffer size 1 to not miss a notification
-        let (injector_notif, injector_notif_recv) = bounded(1);
+        let (wake_up_notif_sender, wake_up_notif_receiver) = bounded(1);
 
         #[allow(clippy::let_and_return)]
         let processor = Processor {
@@ -59,8 +60,9 @@ impl Processor {
             zombie_machines: Spinlock::new(VecDeque::with_capacity(1)),
 
             injector: Injector::new(),
-            injector_notif,
-            injector_notif_recv,
+
+            wake_up_notif_sender,
+            wake_up_notif_receiver,
         };
 
         #[cfg(feature = "tracing")]
@@ -204,7 +206,7 @@ impl Processor {
     fn sleep(&self, system: &System, backoff: &Backoff) {
         if backoff.is_completed() {
             self.last_seen.store(u64::MAX, Ordering::Relaxed);
-            self.injector_notif_recv.recv().unwrap();
+            self.wake_up_notif_receiver.recv().unwrap();
             self.last_seen.store(system.now(), Ordering::Relaxed);
 
             // wake the sysmon in case the sysmon is also sleeping
@@ -222,8 +224,8 @@ impl Processor {
         self.last_seen.load(Ordering::Relaxed)
     }
 
-    pub fn wake_up(&self) {
-        let _ = self.injector_notif.try_send(());
+    pub fn wake_up(&self) -> bool {
+        self.wake_up_notif_sender.try_send(()).is_ok()
     }
 
     pub fn push(&self, task: Task) {
@@ -234,9 +236,6 @@ impl Processor {
     }
 
     pub fn pop(&self, worker: &Worker<Task>) -> Option<Task> {
-        // flush the notification channel
-        let _ = self.injector_notif_recv.try_recv();
-
         // repeat until success or empty
         std::iter::repeat_with(|| self.injector.steal_batch_and_pop(worker))
             .find(|s| !s.is_retry())

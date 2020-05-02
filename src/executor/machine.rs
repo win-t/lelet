@@ -68,9 +68,9 @@ impl Current {
     }
 
     fn push(&self, task: Task) {
-        if let Some((system, _, _)) = self.active.as_ref() {
+        if let Some((system, _, processor)) = self.active.as_ref() {
             self.worker.push(task);
-            system.processors_wake_up();
+            system.processors_wake_up(processor.index);
         }
     }
 

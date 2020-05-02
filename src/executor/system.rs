@@ -30,9 +30,8 @@ pub struct System {
     /// for blocking detection
     tick: AtomicU64,
 
-    // for sysmon wake up notification
-    sysmon_notif: Sender<()>,
-    sysmon_notif_recv: Receiver<()>,
+    wake_up_notif_sender: Sender<()>,
+    wake_up_notif_receiver: Receiver<()>,
 }
 
 // just to make sure
@@ -46,13 +45,10 @@ impl Drop for System {
 impl System {
     pub fn get() -> &'static System {
         static SYSTEM: Lazy<&'static System> = Lazy::new(|| {
-            #[cfg(feature = "tracing")]
-            trace!("Creating system");
-
             let num_cpus = std::cmp::max(1, num_cpus::get());
 
             // channel with buffer size 1 to not miss a notification
-            let (sysmon_notif, sysmon_notif_recv) = bounded(1);
+            let (wake_up_notif_sender, wake_up_notif_receiver) = bounded(1);
 
             let mut processors = Vec::new();
             for index in 0..num_cpus {
@@ -75,8 +71,8 @@ impl System {
 
                 tick: AtomicU64::new(0),
 
-                sysmon_notif,
-                sysmon_notif_recv,
+                wake_up_notif_sender,
+                wake_up_notif_receiver,
             };
 
             thread::spawn(move || abort_on_panic(move || System::get().sysmon_main()));
@@ -89,6 +85,9 @@ impl System {
     }
 
     fn sysmon_main(&'static self) {
+        #[cfg(feature = "tracing")]
+        trace!("Sysmon is running");
+
         // spawn machine for every processor
         self.processors.iter().for_each(Machine::spawn);
 
@@ -116,13 +115,13 @@ impl System {
                 .all(|p| p.get_last_seen() == u64::MAX)
             {
                 // all processor is sleeping, also go to sleep
-                self.sysmon_notif_recv.recv().unwrap();
+                self.wake_up_notif_receiver.recv().unwrap();
             }
         }
     }
 
     pub fn sysmon_wake_up(&self) {
-        let _ = self.sysmon_notif.try_send(());
+        let _ = self.wake_up_notif_sender.try_send(());
     }
 
     pub fn push(&self, task: Task) {
@@ -140,12 +139,17 @@ impl System {
             }
 
             self.processors[index].push(task);
-            self.processors_wake_up();
+            self.processors_wake_up(index);
         }
     }
 
-    pub fn processors_wake_up(&self) {
-        self.processors.iter().for_each(|p| p.wake_up());
+    pub fn processors_wake_up(&self, index: usize) {
+        // wake up processors[index]
+        self.processors[index].wake_up();
+
+        // plus another one, in case processors[index] need help
+        let (l, r) = self.processors.split_at(index + 1);
+        r.iter().chain(l.iter()).find(|p| p.wake_up());
     }
 
     pub fn pop(&self, index: usize, worker: &Worker<Task>) -> Option<Task> {
