@@ -49,7 +49,7 @@ where
     JoinHandle(handle)
 }
 
-/// JoinHandle that you can `await` for it
+/// JoinHandle that you can `await` for
 pub struct JoinHandle<R>(async_task::JoinHandle<R, TaskTag>);
 
 impl<R> Future for JoinHandle<R> {
