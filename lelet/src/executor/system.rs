@@ -44,7 +44,9 @@ impl Drop for System {
 
 impl System {
     pub fn get() -> &'static System {
-        static SYSTEM: Lazy<&'static System> = Lazy::new(|| {
+        static SYSTEM: Lazy<System> = Lazy::new(|| {
+            thread::spawn(move || abort_on_panic(move || System::get().sysmon_main()));
+
             let num_cpus = std::cmp::max(1, num_cpus::get());
 
             // channel with buffer size 1 to not miss a notification
@@ -62,7 +64,7 @@ impl System {
                     assert_eq!(processor.index, index);
                 });
 
-            let system = System {
+            System {
                 num_cpus,
                 processors,
 
@@ -73,12 +75,7 @@ impl System {
 
                 wake_up_notif_sender,
                 wake_up_notif_receiver,
-            };
-
-            thread::spawn(move || abort_on_panic(move || System::get().sysmon_main()));
-
-            // alocate on heap and leak it to make sure it has 'static lifetime
-            unsafe { &*Box::into_raw(Box::new(system)) }
+            }
         });
 
         &SYSTEM
