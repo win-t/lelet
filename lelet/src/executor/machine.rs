@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use crossbeam_deque::{Steal, Stealer, Worker};
@@ -30,24 +31,27 @@ pub struct Machine {
 
 struct Current {
     active: Option<(&'static System, Arc<Machine>, &'static Processor)>,
-    worker: Worker<Task>,
+    worker: Rc<Worker<Task>>,
 }
 
 impl Current {
     fn new() -> Current {
         Current {
             active: None,
-            worker: Worker::new_fifo(),
+            worker: Rc::new(Worker::new_fifo()),
         }
     }
 
-    fn init(&mut self, processor: &'static Processor) {
+    fn init(
+        &mut self,
+        processor: &'static Processor,
+    ) -> (&'static System, Arc<Machine>, Rc<Worker<Task>>) {
         self.clean_up();
-        self.active.replace((
-            System::get(),
-            Arc::new(Machine::new(&self.worker)),
-            processor,
-        ));
+        let system = System::get();
+        let machine = Arc::new(Machine::new(&self.worker));
+        let worker = self.worker.clone();
+        self.active.replace((system, machine.clone(), processor));
+        (system, machine, worker)
     }
 
     fn clean_up(&mut self) {
@@ -73,12 +77,6 @@ impl Current {
         if let Some((system, _, processor)) = self.active.as_ref() {
             self.worker.push(task);
             system.processors_wake_up(processor.index);
-        }
-    }
-
-    fn run(&self) {
-        if let Some((system, machine, processor)) = self.active.as_ref() {
-            processor.run_on(system, machine.clone(), &self.worker);
         }
     }
 }
@@ -114,12 +112,14 @@ impl Machine {
                         cache.borrow_mut().replace(Current::new());
                     }
 
-                    cache.borrow_mut().as_mut().unwrap().init(processor);
+                    let (system, machine, worker) =
+                        cache.borrow_mut().as_mut().unwrap().init(processor);
+
                     defer! {
                         cache.borrow_mut().as_mut().unwrap().clean_up();
                     }
 
-                    cache.borrow().as_ref().unwrap().run();
+                    processor.run_on(system, machine, &worker);
                 });
             })
         }));
