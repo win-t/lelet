@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
@@ -47,7 +48,7 @@ impl System {
         static SYSTEM: Lazy<System> = Lazy::new(|| {
             thread::spawn(move || abort_on_panic(move || System::get().sysmon_main()));
 
-            let num_cpus = std::cmp::max(1, num_cpus::get());
+            let num_cpus = System::get_num_cpus();
 
             // channel with buffer size 1 to not miss a notification
             let (wake_up_notif_sender, wake_up_notif_receiver) = bounded(1);
@@ -182,5 +183,28 @@ impl System {
     #[inline(always)]
     pub fn now(&self) -> u64 {
         self.tick.load(Ordering::Relaxed)
+    }
+}
+
+static NUM_CPUS: Lazy<Mutex<usize>> = Lazy::new(|| Mutex::new(0));
+
+impl System {
+    pub fn set_num_cpus(size: usize) -> Result<(), &'static str> {
+        let mut num_cpus = NUM_CPUS.lock().unwrap();
+        if *num_cpus == 0 {
+            *num_cpus = size;
+            Ok(())
+        } else {
+            Err("num_cpus already set")
+        }
+    }
+
+    fn get_num_cpus() -> usize {
+        let mut num_cpus = NUM_CPUS.lock().unwrap();
+        if *num_cpus == 0 {
+            *num_cpus = std::cmp::max(1, num_cpus::get());
+        }
+
+        *num_cpus
     }
 }

@@ -43,3 +43,6 @@ pub mod thread_pool;
 mod executor;
 pub use executor::spawn;
 pub use executor::JoinHandle;
+
+#[doc(hidden)]
+pub use executor::set_num_cpus;
