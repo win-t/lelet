@@ -75,6 +75,13 @@ impl Current {
 
     fn push(&self, task: Task) {
         if let Some((system, _, processor)) = self.active.as_ref() {
+            #[cfg(feature = "tracing")]
+            trace!(
+                "{:?} directly pushed to {:?}'s machine",
+                task.tag(),
+                processor
+            );
+
             self.worker.push(task);
             system.processors_wake_up(processor.index);
         }
