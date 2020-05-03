@@ -1,5 +1,4 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
@@ -186,13 +185,11 @@ impl System {
     }
 }
 
-static NUM_CPUS: Lazy<Mutex<usize>> = Lazy::new(|| Mutex::new(0));
+static NUM_CPUS: AtomicUsize = AtomicUsize::new(0);
 
 impl System {
     pub fn set_num_cpus(size: usize) -> Result<(), &'static str> {
-        let mut num_cpus = NUM_CPUS.lock().unwrap();
-        if *num_cpus == 0 {
-            *num_cpus = size;
+        if NUM_CPUS.compare_and_swap(0, size, Ordering::Relaxed) == 0 {
             Ok(())
         } else {
             Err("num_cpus already set")
@@ -200,11 +197,9 @@ impl System {
     }
 
     fn get_num_cpus() -> usize {
-        let mut num_cpus = NUM_CPUS.lock().unwrap();
-        if *num_cpus == 0 {
-            *num_cpus = std::cmp::max(1, num_cpus::get());
+        if NUM_CPUS.load(Ordering::Relaxed) == 0 {
+            NUM_CPUS.compare_and_swap(0, std::cmp::max(1, num_cpus::get()), Ordering::Relaxed);
         }
-
-        *num_cpus
+        NUM_CPUS.load(Ordering::Relaxed)
     }
 }

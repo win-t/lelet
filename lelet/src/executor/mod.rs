@@ -25,6 +25,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use self::machine::Machine;
 use self::system::System;
 use self::task::TaskTag;
 
@@ -66,4 +67,8 @@ impl<R> Future for JoinHandle<R> {
 
 pub fn set_num_cpus(size: usize) -> Result<(), &'static str> {
     System::set_num_cpus(size)
+}
+
+pub fn mark_blocking() {
+    Machine::respawn();
 }

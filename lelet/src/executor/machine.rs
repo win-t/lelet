@@ -47,44 +47,52 @@ impl Current {
         processor: &'static Processor,
     ) -> (&'static System, Arc<Machine>, Rc<Worker<Task>>) {
         self.clean_up();
+
         let system = System::get();
         let machine = Arc::new(Machine::new(&self.worker));
         let worker = self.worker.clone();
+
         self.active.replace((system, machine.clone(), processor));
+
         (system, machine, worker)
     }
 
     fn clean_up(&mut self) {
-        if let Some((system, machine, processor)) = self.active.take() {
-            // clean up all task in worker
-            while let Some(task) = self.worker.pop() {
-                task.tag().set_schedule_index_hint(processor.index);
-                system.push(task);
+        self.active.take();
+    }
+
+    fn push(&mut self, task: Task) -> Result<(), Task> {
+        if let Some((system, machine, processor)) = self.active.as_ref() {
+            if processor.still_on_machine(machine) {
+                #[cfg(feature = "tracing")]
+                trace!(
+                    "{:?} directly pushed to {:?}'s machine",
+                    task.tag(),
+                    processor
+                );
+
+                self.worker.push(task);
+                system.processors_wake_up(processor.index);
+
+                Ok(())
+            } else {
+                self.clean_up();
+                Err(task)
             }
-
-            processor.ack_zombie(&machine);
+        } else {
+            Err(task)
         }
     }
 
-    fn still_valid(&self) -> bool {
-        self.active
-            .as_ref()
-            .map(|(_, machine, processor)| processor.still_on_machine(machine))
-            .unwrap_or(false)
-    }
-
-    fn push(&self, task: Task) {
-        if let Some((system, _, processor)) = self.active.as_ref() {
+    fn respawn(&mut self) {
+        if let Some((_, _machine, processor)) = self.active.as_ref() {
             #[cfg(feature = "tracing")]
-            trace!(
-                "{:?} directly pushed to {:?}'s machine",
-                task.tag(),
-                processor
-            );
+            trace!("{:?} giving up on {:?}", _machine, processor);
 
-            self.worker.push(task);
-            system.processors_wake_up(processor.index);
+            Machine::spawn(processor);
         }
+
+        self.clean_up();
     }
 }
 
@@ -115,6 +123,7 @@ impl Machine {
         thread_pool::spawn_box(Box::new(move || {
             abort_on_panic(move || {
                 CACHE.with(|cache| {
+                    // ensure cache
                     if cache.borrow().is_none() {
                         cache.borrow_mut().replace(Current::new());
                     }
@@ -134,17 +143,17 @@ impl Machine {
 
     pub fn direct_push(task: Task) -> Result<(), Task> {
         CACHE.with(|cache| match cache.borrow_mut().as_mut() {
-            Some(current) => {
-                if current.still_valid() {
-                    current.push(task);
-                    Ok(())
-                } else {
-                    current.clean_up();
-                    Err(task)
-                }
-            }
+            Some(current) => current.push(task),
             None => Err(task),
         })
+    }
+
+    pub fn respawn() {
+        CACHE.with(|cache| {
+            if let Some(current) = cache.borrow_mut().as_mut() {
+                current.respawn();
+            }
+        });
     }
 
     pub fn steal(&self, worker: &Worker<Task>) -> Option<Task> {

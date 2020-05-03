@@ -10,6 +10,7 @@ use crossbeam_utils::Backoff;
 #[cfg(feature = "tracing")]
 use log::trace;
 
+use lelet_utils::defer;
 use lelet_utils::Spinlock;
 
 use super::machine::Machine;
@@ -77,9 +78,24 @@ impl Processor {
             self.zombie_machines.lock().push_back(old_machine);
         }
 
-        self.last_seen.store(system.now(), Ordering::Relaxed);
-
         let machine = self.get_current_machine().unwrap();
+
+        // remove machine from zombie list before leaving
+        // and clean up all task in worker in case new machine
+        // don't steal them
+        defer! {
+            self.zombie_machines
+                .lock()
+                .retain(|zombie| !ptr::eq(zombie as &Machine, machine));
+
+            while let Some(task) = worker.pop() {
+                task.tag().set_schedule_index_hint(self.index);
+                system.push(task);
+            }
+        }
+
+        // mark this processor
+        self.last_seen.store(system.now(), Ordering::Relaxed);
 
         #[cfg(feature = "tracing")]
         crate::thread_pool::THREAD_ID.with(|tid| {
@@ -114,7 +130,7 @@ impl Processor {
                     run_counter = 0;
 
                     // also check zombie, in case zombie still pushing
-                    // task directly to its worker, see also ack_zombie
+                    // task directly to its worker
                     self.inherit_zombies(worker);
 
                     if let Some(task) = system.pop(self.index, worker) {
@@ -191,16 +207,6 @@ impl Processor {
             .lock()
             .iter()
             .for_each(|zombie| zombie.steal_all(worker));
-    }
-
-    /// this is a promise that machine will not push
-    /// to its worker anymore
-    /// so we can safely remove machine from zombie list,
-    /// and no task is stalled on machine worker
-    pub fn ack_zombie(&self, machine: &Machine) {
-        self.zombie_machines
-            .lock()
-            .retain(|zombie| !ptr::eq(zombie as &Machine, machine));
     }
 
     fn sleep(&self, system: &System, backoff: &Backoff) {
