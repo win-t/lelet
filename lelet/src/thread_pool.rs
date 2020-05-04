@@ -42,15 +42,14 @@ impl Pool {
     fn put_job(&'static self, job: Job) {
         self.sender.try_send(job).unwrap_or_else(|err| match err {
             TrySendError::Full(job) => {
-                let receiver = self.receiver.clone();
-                thread::spawn(move || self.main(receiver));
+                thread::spawn(move || self.main());
                 self.sender.send(job).unwrap();
             }
             TrySendError::Disconnected(_) => unreachable!(), // we hold both side of the channel
         });
     }
 
-    fn main(&self, receiver: Receiver<Job>) {
+    fn main(&self) {
         #[cfg(feature = "tracing")]
         THREAD_ID.with(|id| {
             static THREAD_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -59,7 +58,7 @@ impl Pool {
         });
 
         loop {
-            match receiver.recv_timeout(IDLE_THRESHOLD) {
+            match self.receiver.recv_timeout(IDLE_THRESHOLD) {
                 Ok(job) => {
                     #[cfg(feature = "tracing")]
                     THREAD_ID.with(|id| {

@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
@@ -26,7 +26,7 @@ pub struct Processor {
     last_seen: AtomicU64,
 
     /// current machine that holding the processor
-    current_machine: AtomicPtr<Machine>,
+    current_machine: Spinlock<Option<Arc<Machine>>>,
 
     /// machines that holding the processor in the past, but still alive
     zombie_machines: Spinlock<VecDeque<Arc<Machine>>>,
@@ -57,7 +57,7 @@ impl Processor {
 
             last_seen: AtomicU64::new(0),
 
-            current_machine: AtomicPtr::new(ptr::null_mut()),
+            current_machine: Spinlock::new(None),
             zombie_machines: Spinlock::new(VecDeque::with_capacity(1)),
 
             injector: Injector::new(),
@@ -74,11 +74,11 @@ impl Processor {
 
     pub fn run_on(&self, system: &System, machine: Arc<Machine>, worker: &Worker<Task>) {
         // steal this processor from old machine and add old machine to zombie list
-        if let Some(old_machine) = self.swap_machine(machine) {
+        if let Some(old_machine) = self.current_machine.lock().replace(machine) {
             self.zombie_machines.lock().push_back(old_machine);
         }
 
-        let machine = self.get_current_machine().unwrap();
+        let machine = &self.get_current_machine().unwrap() as &Machine;
 
         // remove machine from zombie list before leaving
         // and clean up all task in worker in case new machine
@@ -175,30 +175,17 @@ impl Processor {
         }
     }
 
-    fn swap_machine(&self, machine: Arc<Machine>) -> Option<Arc<Machine>> {
-        let mut machine = Arc::into_raw(machine) as *mut _;
-        machine = self.current_machine.swap(machine, Ordering::Relaxed);
-        if machine.is_null() {
-            None
-        } else {
-            Some(unsafe { Arc::from_raw(machine) })
-        }
-    }
-
     #[inline(always)]
-    pub fn get_current_machine(&self) -> Option<&Machine> {
-        let current_machine = self.current_machine.load(Ordering::Relaxed);
-        if current_machine.is_null() {
-            None
-        } else {
-            Some(unsafe { &*current_machine })
-        }
+    pub fn get_current_machine(&self) -> Option<Arc<Machine>> {
+        self.current_machine.lock().as_ref().map(|m| m.clone())
     }
 
     #[inline(always)]
     pub fn still_on_machine(&self, machine: &Machine) -> bool {
-        self.get_current_machine()
-            .map(|current_machine| ptr::eq(current_machine, machine))
+        self.current_machine
+            .lock()
+            .as_ref()
+            .map(|current_machine| ptr::eq(current_machine as &Machine, machine))
             .unwrap_or(false)
     }
 

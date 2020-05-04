@@ -165,8 +165,7 @@ impl System {
         let (l, r) = self.processors.split_at(m);
         (1..)
             .zip(r.iter().chain(l.iter()).map(|p| p.get_current_machine()))
-            .filter(|(_, m)| m.is_some())
-            .map(|(hint_add, m)| (hint_add, m.unwrap().steal(worker)))
+            .map(|(hint_add, m)| (hint_add, m.map(|m| m.steal(worker)).unwrap_or(None)))
             .find(|(_, s)| s.is_some())
             .map(|(hint_add, s)| {
                 self.steal_index_hint.compare_and_swap(
@@ -188,18 +187,20 @@ impl System {
 static NUM_CPUS: AtomicUsize = AtomicUsize::new(0);
 
 impl System {
-    pub fn set_num_cpus(size: usize) -> Result<(), &'static str> {
-        if NUM_CPUS.compare_and_swap(0, size, Ordering::Relaxed) == 0 {
+    pub fn set_num_cpus(size: usize) -> Result<(), String> {
+        let old_value = NUM_CPUS.compare_and_swap(0, size, Ordering::Relaxed);
+        if old_value == 0 {
             Ok(())
         } else {
-            Err("num_cpus already set")
+            Err(format!("num_cpus already set to {}", old_value))
         }
     }
 
     fn get_num_cpus() -> usize {
-        if NUM_CPUS.load(Ordering::Relaxed) == 0 {
-            NUM_CPUS.compare_and_swap(0, std::cmp::max(1, num_cpus::get()), Ordering::Relaxed);
+        let num_cpus = &NUM_CPUS;
+        if num_cpus.load(Ordering::Relaxed) == 0 {
+            num_cpus.compare_and_swap(0, std::cmp::max(1, num_cpus::get()), Ordering::Relaxed);
         }
-        NUM_CPUS.load(Ordering::Relaxed)
+        num_cpus.load(Ordering::Relaxed)
     }
 }

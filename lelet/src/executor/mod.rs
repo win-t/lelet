@@ -65,7 +65,7 @@ impl<R> Future for JoinHandle<R> {
     }
 }
 
-pub fn set_num_cpus(size: usize) -> Result<(), &'static str> {
+pub fn set_num_cpus(size: usize) -> Result<(), String> {
     System::set_num_cpus(size)
 }
 
