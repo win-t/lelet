@@ -71,12 +71,12 @@ pub async fn yield_now() {
 /// because it is private in that crate
 ///
 /// [`crossbeam_channel`]: https://docs.rs/crossbeam-channel
-pub struct Spinlock<T> {
+pub struct Spinlock<T: ?Sized> {
     flag: AtomicBool,
     value: UnsafeCell<T>,
 }
 
-unsafe impl<T> Sync for Spinlock<T> {}
+unsafe impl<T: ?Sized + Send> Sync for Spinlock<T> {}
 
 impl<T> Spinlock<T> {
     /// Returns a new spinlock initialized with `value`.
