@@ -2,14 +2,15 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use crossbeam_channel::{bounded, Receiver, Sender};
-use crossbeam_deque::Worker;
+use crossbeam_deque::{Injector, Steal, Worker};
 use once_cell::sync::Lazy;
 
 #[cfg(feature = "tracing")]
 use log::trace;
 
 use lelet_utils::abort_on_panic;
+
+use crate::utils::Sleeper;
 
 use super::machine::Machine;
 use super::processor::Processor;
@@ -19,19 +20,18 @@ use super::Task;
 const BLOCKING_THRESHOLD: Duration = Duration::from_millis(10);
 
 pub struct System {
-    num_cpus: usize,
-
     /// all processors
-    processors: Vec<Processor>,
+    pub processors: Vec<Processor>,
 
-    processor_push_index_hint: AtomicUsize,
+    /// global queue
+    injector: Injector<Task>,
+
     steal_index_hint: AtomicUsize,
 
     /// for blocking detection
     tick: AtomicU64,
 
-    wake_up_notif_sender: Sender<()>,
-    wake_up_notif_receiver: Receiver<()>,
+    sleeper: Sleeper,
 }
 
 // just to make sure
@@ -49,10 +49,7 @@ impl System {
 
             let num_cpus = System::get_num_cpus();
 
-            // channel with buffer size 1 to not miss a notification
-            let (wake_up_notif_sender, wake_up_notif_receiver) = bounded(1);
-
-            let mut processors = Vec::new();
+            let mut processors = Vec::with_capacity(num_cpus);
             for index in 0..num_cpus {
                 processors.push(Processor::new(index));
             }
@@ -65,16 +62,11 @@ impl System {
                 });
 
             System {
-                num_cpus,
                 processors,
-
-                processor_push_index_hint: AtomicUsize::new(0),
+                injector: Injector::new(),
                 steal_index_hint: AtomicUsize::new(0),
-
                 tick: AtomicU64::new(0),
-
-                wake_up_notif_sender,
-                wake_up_notif_receiver,
+                sleeper: Sleeper::new(),
             }
         });
 
@@ -86,7 +78,9 @@ impl System {
         trace!("Sysmon is running");
 
         // spawn machine for every processor
-        self.processors.iter().for_each(Machine::spawn);
+        self.processors
+            .iter()
+            .for_each(|p| Machine::spawn(self, p.index));
 
         loop {
             let check_tick = self.tick.fetch_add(1, Ordering::Relaxed) + 1;
@@ -104,7 +98,7 @@ impl System {
                 p
             });
 
-            processors.for_each(Machine::spawn);
+            processors.for_each(|p| Machine::spawn(self, p.index));
 
             if self
                 .processors
@@ -112,30 +106,30 @@ impl System {
                 .all(|p| p.get_last_seen() == u64::MAX)
             {
                 // all processor is sleeping, also go to sleep
-                self.wake_up_notif_receiver.recv().unwrap();
+                self.sleeper.sleep();
             }
         }
     }
 
     pub fn sysmon_wake_up(&self) {
-        let _ = self.wake_up_notif_sender.try_send(());
+        self.sleeper.wake_up();
     }
 
     pub fn push(&self, task: Task) {
         if let Err(task) = Machine::direct_push(task) {
-            let mut index = task.tag().get_schedule_index_hint();
+            #[cfg(feature = "tracing")]
+            trace!("{:?} is pushed to global queue", task.tag());
 
-            // if the task does not have prefered processor, we pick one
-            if index >= self.num_cpus {
-                index = self.processor_push_index_hint.load(Ordering::Relaxed);
-                self.processor_push_index_hint.compare_and_swap(
-                    index,
-                    (index + 1) % self.num_cpus,
-                    Ordering::Relaxed,
-                );
+            self.injector.push(task);
+
+            // wake up processor that unlikely to be stolen near future
+            let mut index = self.steal_index_hint.load(Ordering::Relaxed);
+            if index == 0 {
+                index = self.processors.len() - 1;
+            } else {
+                index -= 1;
             }
 
-            self.processors[index].push(task);
             self.processors_wake_up(index);
         }
     }
@@ -149,28 +143,29 @@ impl System {
         r.iter().chain(l.iter()).find(|p| p.wake_up());
     }
 
-    pub fn pop(&self, index: usize, worker: &Worker<Task>) -> Option<Task> {
-        // pop from global queue that dedicated to processor[index],
-        // if None, pop from others
-        let (l, r) = self.processors.split_at(index);
-        r.iter()
-            .chain(l.iter())
-            .map(|p| p.pop(worker))
-            .find(|s| s.is_some())
+    pub fn pop(&self, worker: &Worker<Task>) -> Option<Task> {
+        // repeat until success or empty
+        std::iter::repeat_with(|| self.injector.steal_batch_and_pop(worker))
+            .find(|s| !s.is_retry())
+            .map(|s| match s {
+                Steal::Success(task) => Some(task),
+                Steal::Empty => None,
+                Steal::Retry => unreachable!(), // already filtered
+            })
             .flatten()
     }
 
     pub fn steal(&self, worker: &Worker<Task>) -> Option<Task> {
-        let m = self.steal_index_hint.load(Ordering::Relaxed);
-        let (l, r) = self.processors.split_at(m);
+        let hint = self.steal_index_hint.load(Ordering::Relaxed);
+        let (l, r) = self.processors.split_at(hint);
         (1..)
-            .zip(r.iter().chain(l.iter()).map(|p| p.get_current_machine()))
-            .map(|(hint_add, m)| (hint_add, m.map(|m| m.steal(worker)).unwrap_or(None)))
+            .zip(r.iter().chain(l.iter()))
+            .map(|(hint_add, p)| (hint_add, p.steal(worker)))
             .find(|(_, s)| s.is_some())
             .map(|(hint_add, s)| {
                 self.steal_index_hint.compare_and_swap(
-                    m,
-                    (m + hint_add) % self.num_cpus,
+                    hint,
+                    (hint + hint_add) % self.processors.len(),
                     Ordering::Relaxed,
                 );
                 s

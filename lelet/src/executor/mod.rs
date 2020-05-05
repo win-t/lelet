@@ -4,16 +4,9 @@
 // understand this code.
 //
 // Noticable difference with golang scheduler
-// 0. we called goroutine as task (obviously)
-//    we called local queue as worker (from crossbeam-deque)
-//    we called global queue as injector (from crossbeam-deque)
-// 1. worker (local queue) is attached to each machine's thread TLS instead of processor
-//    because worker is !Sync
-// 2. each processor have dedicated injector (global queue), when processor need more task,
-//    it prioritized the dedicated one over others
-// 3. new machine steal the processor from old one when it run the processor instead of
+// 1. new machine steal the processor from old one when it run the processor instead of
 //    acquire/release from global list
-// 4. machine don't live without a processor (when stolen by new machine),
+// 2. machine don't live without a processor (when stolen by new machine),
 //    it must exit as soon as possible
 
 mod machine;

@@ -1,3 +1,4 @@
+#[cfg(feature = "tracing")]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(feature = "tracing")]
@@ -6,8 +7,6 @@ use log::trace;
 pub struct TaskTag {
     #[cfg(feature = "tracing")]
     id: usize,
-
-    schedule_index_hint: AtomicUsize,
 }
 
 impl TaskTag {
@@ -19,22 +18,12 @@ impl TaskTag {
         let tag = TaskTag {
             #[cfg(feature = "tracing")]
             id: TASK_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
-
-            schedule_index_hint: AtomicUsize::new(usize::MAX),
         };
 
         #[cfg(feature = "tracing")]
         trace!("{:?} is created", tag);
 
         tag
-    }
-
-    pub fn get_schedule_index_hint(&self) -> usize {
-        self.schedule_index_hint.load(Ordering::Relaxed)
-    }
-
-    pub fn set_schedule_index_hint(&self, index: usize) {
-        self.schedule_index_hint.store(index, Ordering::Relaxed);
     }
 }
 
