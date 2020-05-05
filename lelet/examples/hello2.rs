@@ -4,7 +4,6 @@ use std::time::Duration;
 use futures_timer::Delay;
 
 fn main() {
-    #[cfg(feature = "tracing")]
     simple_logger::init().unwrap();
 
     for i in 0..10 {
