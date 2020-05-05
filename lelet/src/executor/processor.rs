@@ -149,13 +149,19 @@ impl Processor {
         f();
 
         if machine_before_unlock == self.current_machine_id.load(Ordering::Relaxed) {
-            Ok(self.queue.lock())
+            let lock = Ok(self.queue.lock());
+            if machine_before_unlock == self.current_machine_id.load(Ordering::Relaxed) {
+                lock
+            } else {
+                drop(lock);
+                Err(())
+            }
         } else {
             Err(())
         }
     }
 
-    /// will return usize::MAX when processor is sleeping (always seen in the future)
+    /// will return u64::MAX when processor is sleeping (always seen in the future)
     #[inline(always)]
     pub fn get_last_seen(&self) -> u64 {
         self.last_seen.load(Ordering::Relaxed)
