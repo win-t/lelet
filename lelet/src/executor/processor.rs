@@ -166,7 +166,7 @@ impl Processor {
     }
 
     /// unlock the queue lock, run f, and then reacquire queue lock,
-    /// will fail if processor is stolen (processor.current_machine_id != machine.id)
+    /// will fail if machine no longer hold the processor (stolen)
     #[inline(always)]
     fn unlock_and_then(
         &self,
@@ -218,7 +218,7 @@ impl Processor {
         self.sleeper.wake_up()
     }
 
-    pub fn push(&self, machine: &Machine, task: Task) -> Result<(), Task> {
+    pub fn check_and_push(&self, machine: &Machine, task: Task) -> Result<(), Task> {
         // fast check, without lock
         if self.current_machine_id.load(Ordering::Relaxed) != machine.id {
             return Err(task);

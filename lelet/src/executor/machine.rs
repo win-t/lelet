@@ -71,9 +71,17 @@ pub fn spawn(system: &'static System, processor_index: usize) {
 }
 
 pub fn direct_push(task: Task) -> Result<(), Task> {
-    CURRENT.with(|current| match current.borrow().as_ref() {
-        Some(m) => m.system.processors[m.processor_index].push(m, task),
-        None => Err(task),
+    CURRENT.with(|current| {
+        let mut current = current.borrow_mut();
+        match current.as_ref() {
+            None => Err(task),
+            Some(m) => m.system.processors[m.processor_index]
+                .check_and_push(m, task)
+                .map_err(|err| {
+                    current.take();
+                    err
+                }),
+        }
     })
 }
 
