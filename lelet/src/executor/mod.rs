@@ -6,7 +6,7 @@
 // Noticable difference with golang scheduler
 // 1. new machine steal the processor from old one when it run the processor instead of
 //    acquire/release from global list
-// 2. machine don't live without a processor (when stolen by new machine),
+// 2. machine don't live without a processor (when stolen by others),
 //    it must exit as soon as possible
 
 mod machine;
@@ -14,12 +14,14 @@ mod processor;
 mod system;
 mod task;
 
+pub use machine::respawn as mark_blocking;
+pub use system::get_num_cpus;
+pub use system::set_num_cpus;
+
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use self::machine::Machine;
-use self::system::System;
 use self::task::TaskTag;
 
 type Task = async_task::Task<TaskTag>;
@@ -37,7 +39,7 @@ where
     T: Future<Output = R> + Send + 'static,
     R: Send + 'static,
 {
-    let system = System::get();
+    let system = system::get();
     let (task, handle) = async_task::spawn(task, move |task| system.push(task), TaskTag::new());
     task.schedule();
     JoinHandle(handle)
@@ -56,12 +58,4 @@ impl<R> Future for JoinHandle<R> {
             Poll::Ready(None) => unreachable!(), // we don't provide api to cancel the task
         }
     }
-}
-
-pub fn set_num_cpus(size: usize) -> Result<(), String> {
-    System::set_num_cpus(size)
-}
-
-pub fn mark_blocking() {
-    Machine::respawn();
 }

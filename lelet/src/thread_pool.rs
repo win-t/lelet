@@ -39,17 +39,29 @@ struct Pool {
 }
 
 impl Pool {
+    fn new() -> Pool {
+        let (sender, receiver) = bounded(0);
+        Pool {
+            base: Instant::now(),
+            next_exit: AtomicUsize::new(0),
+            sender,
+            receiver,
+        }
+    }
+
     fn put_job(&'static self, job: Job) {
         self.sender.try_send(job).unwrap_or_else(|err| match err {
             TrySendError::Full(job) => {
-                thread::spawn(move || self.main());
+                thread::spawn(move || self.run());
                 self.sender.send(job).unwrap();
             }
-            TrySendError::Disconnected(_) => unreachable!(), // we hold both side of the channel
+
+            // we hold both side of the channel
+            TrySendError::Disconnected(_) => unreachable!(),
         });
     }
 
-    fn main(&self) {
+    fn run(&self) {
         #[cfg(feature = "tracing")]
         THREAD_ID.with(|id| {
             static THREAD_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -72,6 +84,7 @@ impl Pool {
                         trace!("{:?} is done and cached for reused", id);
                     });
                 }
+
                 _ => {
                     let now = Instant::now();
                     let next_exit = self.next_exit.load(Ordering::Relaxed);
@@ -102,15 +115,6 @@ impl Pool {
 }
 
 pub fn spawn_box(job: Job) {
-    static POOL: Lazy<Pool> = Lazy::new(|| {
-        let (sender, receiver) = bounded(0);
-        Pool {
-            base: Instant::now(),
-            next_exit: AtomicUsize::new(0),
-            sender,
-            receiver,
-        }
-    });
-
+    static POOL: Lazy<Pool> = Lazy::new(Pool::new);
     POOL.put_job(job);
 }

@@ -21,6 +21,7 @@ pub struct Processor {
     last_seen: AtomicU64,
 
     /// current machine that holding the processor
+    /// usize::MAX mean the processor is not running on any machine
     current_machine_id: AtomicUsize,
 
     queue: Queue,
@@ -45,20 +46,38 @@ impl Processor {
         processor
     }
 
-    pub fn run(&self) {
-        let machine = Machine::get();
-        if machine.is_none() {
-            return;
-        }
-
-        let machine = machine.unwrap();
-        assert_eq!(self.index, machine.processor_index);
-
+    pub fn run_on(&self, machine: &Machine) {
         let system = machine.system;
+
+        assert_eq!(self.index, machine.processor_index);
         assert!(std::ptr::eq(self, &system.processors[self.index]));
 
-        let mut queue = self.queue.lock();
-        self.current_machine_id.store(machine.id, Ordering::Relaxed);
+        let mut queue = {
+            // steal this processor from current machine
+            self.current_machine_id.store(machine.id, Ordering::Relaxed);
+
+            let lock = self.queue.lock();
+
+            // check again after locking
+            if self.current_machine_id.load(Ordering::Relaxed) != machine.id {
+                drop(lock);
+                return;
+            }
+
+            lock
+        };
+
+        macro_rules! without_lock {
+            ($fn:expr) => {
+                queue = match self.unlock_and_then(&machine, queue, $fn) {
+                    Ok(queue) => queue,
+
+                    // fail mean processor is no longer on machine (stolen),
+                    // exit now
+                    Err(()) => return,
+                };
+            };
+        }
 
         #[cfg(feature = "tracing")]
         crate::thread_pool::THREAD_ID.with(|tid| {
@@ -66,30 +85,34 @@ impl Processor {
         });
 
         // Number of runs in a row before the global queue is inspected.
-        const MAX_RUNS: usize = 16;
+        const MAX_RUNS: usize = 61;
         let mut run_counter = 0;
-
-        let backoff = Backoff::new();
 
         loop {
             macro_rules! run_task {
-                ($task:ident) => {
+                ($task:expr) => {
                     let mut woken = false;
 
                     #[cfg(feature = "tracing")]
                     trace!("{:?} is going to run on {:?}", $task.tag(), self);
 
-                    queue = match self.unlock_and_then(queue, || woken = $task.run()) {
-                        Ok(queue) => queue,
-                        Err(()) => return,
-                    };
+                    without_lock!(|| woken = $task.run());
 
                     run_counter += 1;
+
                     if woken {
                         queue.flush();
                     }
 
                     continue;
+                };
+            }
+
+            macro_rules! run_local_task {
+                () => {
+                    if let Some(task) = queue.pop() {
+                        run_task!(task);
+                    }
                 };
             }
 
@@ -102,6 +125,14 @@ impl Processor {
                 };
             }
 
+            macro_rules! run_stolen_task {
+                () => {
+                    if let Some(task) = system.steal(queue.as_worker_ref()) {
+                        run_task!(task);
+                    }
+                };
+            }
+
             // mark this processor on every iteration
             self.last_seen.store(system.now(), Ordering::Relaxed);
 
@@ -109,33 +140,24 @@ impl Processor {
                 run_global_task!();
             }
 
-            // run all task in the worker
-            if let Some(task) = queue.pop() {
-                run_task!(task);
-            }
+            run_local_task!();
 
-            // at this point, the worker is empty
+            // when local queue is empty:
 
-            // 1. pop from global queue
+            // 1. get from global queue
             run_global_task!();
 
             // 2. steal from others
-            if let Some(task) = system.steal(queue.as_worker_ref()) {
-                run_task!(task);
-            }
+            run_stolen_task!();
 
             // 3.a. no more task for now, just sleep
-            if backoff.is_completed() {
+            {
                 self.last_seen.store(u64::MAX, Ordering::Relaxed);
                 self.sleeper.sleep();
                 self.last_seen.store(system.now(), Ordering::Relaxed);
 
                 // wake the sysmon in case the sysmon is also sleeping
                 system.sysmon_wake_up();
-
-                backoff.reset();
-            } else {
-                backoff.snooze();
             }
 
             // 3.b. after sleep, pop from global queue
@@ -143,26 +165,34 @@ impl Processor {
         }
     }
 
+    /// unlock the queue lock, run f, and then reacquire queue lock,
+    /// will fail if processor is stolen (processor.current_machine_id != machine.id)
     #[inline(always)]
-    fn unlock_and_then(&self, lock: QueueLock, f: impl FnOnce()) -> Result<QueueLock, ()> {
-        let machine_before_unlock = self.current_machine_id.load(Ordering::Relaxed);
+    fn unlock_and_then(
+        &self,
+        machine: &Machine,
+        lock: QueueLock,
+        f: impl FnOnce(),
+    ) -> Result<QueueLock, ()> {
         drop(lock);
 
         f();
 
         let backoff = Backoff::new();
         loop {
-            if machine_before_unlock != self.current_machine_id.load(Ordering::Relaxed) {
+            // fast check, without lock
+            if self.current_machine_id.load(Ordering::Relaxed) != machine.id {
                 return Err(());
             }
 
             if let Some(lock) = self.queue.try_lock() {
-                if machine_before_unlock == self.current_machine_id.load(Ordering::Relaxed) {
-                    return Ok(lock);
-                } else {
+                // check again after locking
+                if self.current_machine_id.load(Ordering::Relaxed) != machine.id {
                     drop(lock);
                     return Err(());
                 }
+
+                return Ok(lock);
             }
 
             if backoff.is_completed() {
@@ -179,28 +209,37 @@ impl Processor {
         self.last_seen.load(Ordering::Relaxed)
     }
 
+    #[inline(always)]
+    pub fn is_sleeping(&self) -> bool {
+        self.get_last_seen() == u64::MAX
+    }
+
     pub fn wake_up(&self) -> bool {
         self.sleeper.wake_up()
     }
 
-    /// will fail if other machine hold the processor
-    pub fn push(&self, task: Task) -> Result<(), Task> {
-        let backoff = Backoff::new();
-        loop {
-            if let Some(mut queue) = self.queue.try_lock() {
-                #[cfg(feature = "tracing")]
-                trace!("{:?} directly pushed to {:?} local queue", task.tag(), self);
+    pub fn push(&self, machine: &Machine, task: Task) -> Result<(), Task> {
+        // fast check, without lock
+        if self.current_machine_id.load(Ordering::Relaxed) != machine.id {
+            return Err(task);
+        }
 
-                queue.push(task);
-
-                return Ok(());
-            }
-
-            if backoff.is_completed() {
+        if let Some(mut queue) = self.queue.try_lock() {
+            // check again after locking
+            if self.current_machine_id.load(Ordering::Relaxed) != machine.id {
+                drop(queue);
                 return Err(task);
-            } else {
-                backoff.snooze()
             }
+
+            #[cfg(feature = "tracing")]
+            trace!("{:?} directly pushed to {:?} local queue", task.tag(), self);
+
+            queue.push(task);
+            machine.system.processors_wake_up();
+
+            Ok(())
+        } else {
+            Err(task)
         }
     }
 
@@ -257,6 +296,8 @@ struct Queue {
     stealer: Stealer<Task>,
 }
 
+type QueueLock<'a> = MutexGuard<'a, WorkerWrapper>;
+
 impl Queue {
     fn new() -> Queue {
         let worker = Worker::new_fifo();
@@ -268,29 +309,25 @@ impl Queue {
     }
 
     fn lock(&self) -> QueueLock {
-        QueueLock(self.worker.lock().unwrap())
+        let backoff = Backoff::new();
+        loop {
+            if let Some(lock) = self.try_lock() {
+                return lock;
+            }
+
+            if backoff.is_completed() {
+                return self.worker.lock().unwrap();
+            } else {
+                backoff.snooze();
+            }
+        }
     }
 
     fn try_lock(&self) -> Option<QueueLock> {
         match self.worker.try_lock() {
-            Ok(lock) => Some(QueueLock(lock)),
+            Ok(lock) => Some(lock),
             Err(TryLockError::WouldBlock) => None,
             Err(TryLockError::Poisoned(err)) => Err(err).unwrap(),
         }
-    }
-}
-
-struct QueueLock<'a>(MutexGuard<'a, WorkerWrapper>);
-
-impl<'a> std::ops::Deref for QueueLock<'a> {
-    type Target = WorkerWrapper;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl<'a> std::ops::DerefMut for QueueLock<'a> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
     }
 }

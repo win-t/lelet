@@ -47,6 +47,8 @@ pub use executor::JoinHandle;
 mod utils;
 
 #[doc(hidden)]
+pub use executor::get_num_cpus;
+#[doc(hidden)]
 pub use executor::set_num_cpus;
 
 #[doc(hidden)]

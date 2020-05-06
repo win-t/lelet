@@ -25,10 +25,9 @@ thread_local! {
 }
 
 impl Machine {
-    fn new(system: &'static System, processor_index: usize) -> Machine {
+    fn new(system: &'static System, processor_index: usize) -> Rc<Machine> {
         static MACHINE_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-        #[allow(clippy::let_and_return)]
         let machine = Machine {
             id: MACHINE_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
             system,
@@ -38,60 +37,14 @@ impl Machine {
         #[cfg(feature = "tracing")]
         trace!("{:?} is created", machine);
 
-        machine
+        Rc::new(machine)
     }
 
-    pub fn spawn(system: &'static System, processor_index: usize) {
-        thread_pool::spawn_box(Box::new(move || {
-            abort_on_panic(move || {
-                CURRENT.with(|current| {
-                    current
-                        .borrow_mut()
-                        .replace(Rc::new(Machine::new(system, processor_index)));
+    fn run(self: Rc<Machine>) {
+        CURRENT.with(|m| m.borrow_mut().replace(self.clone()));
+        defer! { CURRENT.with(|m| { m.borrow_mut().take() }); }
 
-                    defer! {
-                        current.borrow_mut().take();
-                    }
-
-                    system.processors[processor_index].run();
-                });
-            })
-        }));
-    }
-
-    pub fn direct_push(task: Task) -> Result<(), Task> {
-        CURRENT.with(|current| {
-            let mut current = current.borrow_mut();
-            match current.as_ref() {
-                None => Err(task),
-                Some(m) => m.system.processors[m.processor_index]
-                    .push(task)
-                    .map_err(|err| {
-                        // current no longer hold it processor, take it out
-                        current.take();
-                        err
-                    }),
-            }
-        })
-    }
-
-    pub fn respawn() {
-        CURRENT.with(|current| {
-            if let Some(m) = current.borrow_mut().take() {
-                #[cfg(feature = "tracing")]
-                trace!(
-                    "{:?} giving up on {:?}",
-                    m,
-                    m.system.processors[m.processor_index]
-                );
-
-                Machine::spawn(m.system, m.processor_index)
-            }
-        })
-    }
-
-    pub fn get() -> Option<Rc<Machine>> {
-        CURRENT.with(|current| current.borrow().as_ref().cloned())
+        self.system.processors[self.processor_index].run_on(&self);
     }
 }
 
@@ -107,4 +60,34 @@ impl Drop for Machine {
     fn drop(&mut self) {
         trace!("{:?} is destroyed", self);
     }
+}
+
+pub fn spawn(system: &'static System, processor_index: usize) {
+    thread_pool::spawn_box(Box::new(move || {
+        abort_on_panic(move || {
+            Machine::new(system, processor_index).run();
+        })
+    }));
+}
+
+pub fn direct_push(task: Task) -> Result<(), Task> {
+    CURRENT.with(|current| match current.borrow().as_ref() {
+        Some(m) => m.system.processors[m.processor_index].push(m, task),
+        None => Err(task),
+    })
+}
+
+pub fn respawn() {
+    CURRENT.with(|current| {
+        if let Some(m) = current.borrow_mut().take() {
+            #[cfg(feature = "tracing")]
+            trace!(
+                "{:?} giving up on {:?}",
+                m,
+                m.system.processors[m.processor_index]
+            );
+
+            spawn(m.system, m.processor_index)
+        }
+    })
 }
