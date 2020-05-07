@@ -77,9 +77,10 @@ impl<T> Spinlock<T> {
     /// Try to lock the spinlock.
     #[inline(always)]
     pub fn try_lock(&self) -> Option<SpinlockGuard<'_, T>> {
-        match self.locked.swap(true, Ordering::Acquire) {
-            true => None,
-            false => Some(SpinlockGuard { parent: self }),
+        if self.locked.swap(true, Ordering::Acquire) {
+            None
+        } else {
+            Some(SpinlockGuard { parent: self })
         }
     }
 
@@ -92,9 +93,10 @@ impl<T> Spinlock<T> {
                 return guard;
             }
 
-            match backoff.is_completed() {
-                true => thread::yield_now(),
-                false => backoff.snooze(),
+            if backoff.is_completed() {
+                thread::yield_now()
+            } else {
+                backoff.snooze()
             }
         }
     }
