@@ -59,21 +59,12 @@ impl Processor {
         self.current_machine
             .store(machine as *const _ as *mut _, Ordering::Relaxed);
 
-        let mut queue = match self.check_and_acquire_queue(machine) {
-            Ok(queue) => queue,
+        let mut worker = match self.check_machine_and_acquire_worker(machine) {
+            Ok(worker) => worker,
             Err(()) => return,
         };
 
         self.last_seen.store(u64::MAX, Ordering::Relaxed);
-
-        macro_rules! run_without_lock {
-            ($f:expr) => {
-                queue = match self.unlock_queue_and_then(machine, queue, $f) {
-                    Ok(queue) => queue,
-                    Err(()) => return,
-                };
-            };
-        }
 
         #[cfg(feature = "tracing")]
         crate::thread_pool::THREAD_ID.with(|tid| {
@@ -88,7 +79,10 @@ impl Processor {
             macro_rules! run_task {
                 ($task:expr) => {
                     #[cfg(feature = "tracing")]
-                    trace!("{:?} is going to run on {:?}", $task.tag(), self);
+                    let task_info = format!("{:?}", $task.tag());
+
+                    #[cfg(feature = "tracing")]
+                    trace!("{} is running on {:?}", task_info, self);
 
                     self.current_task
                         .store($task.tag() as *const _ as *mut _, Ordering::Relaxed);
@@ -96,13 +90,24 @@ impl Processor {
                     self.last_seen
                         .store(machine.system.now(), Ordering::Relaxed);
 
-                    run_without_lock!(|| {
+                    worker = match self.unlock_worker_and_then(machine, worker, || {
                         $task.run();
-                    });
+                    }) {
+                        Ok(worker) => worker,
+                        Err(()) => {
+                            #[cfg(feature = "tracing")]
+                            trace!("{} is done blocking {:?}", task_info, machine);
+
+                            return;
+                        }
+                    };
 
                     self.last_seen.store(u64::MAX, Ordering::Relaxed);
 
                     self.current_task.store(ptr::null_mut(), Ordering::Relaxed);
+
+                    #[cfg(feature = "tracing")]
+                    trace!("{} is done running on {:?}", task_info, self);
 
                     run_counter += 1;
 
@@ -112,7 +117,7 @@ impl Processor {
 
             macro_rules! run_local_task {
                 () => {
-                    if let Some(task) = queue.pop() {
+                    if let Some(task) = worker.pop() {
                         run_task!(task);
                     }
                 };
@@ -121,7 +126,7 @@ impl Processor {
             macro_rules! run_global_task {
                 () => {
                     run_counter = 0;
-                    if let Some(task) = machine.system.pop(queue.as_worker_ref()) {
+                    if let Some(task) = machine.system.pop(worker.get_ref()) {
                         run_task!(task);
                     }
                 };
@@ -129,7 +134,7 @@ impl Processor {
 
             macro_rules! run_stolen_task {
                 () => {
-                    if let Some(task) = machine.system.steal(queue.as_worker_ref()) {
+                    if let Some(task) = machine.system.steal(worker.get_ref()) {
                         run_task!(task);
                     }
                 };
@@ -159,7 +164,13 @@ impl Processor {
 
     /// will fail if machine no longer hold the processor (stolen)
     #[inline(always)]
-    fn check_and_acquire_queue(&self, machine: &Machine) -> Result<QueueLock, ()> {
+    fn check_machine_and_acquire_worker(
+        &self,
+        machine: &Machine,
+    ) -> Result<SpinlockGuard<'_, WorkerWrapper>, ()> {
+        const SPIN_THRESHOLD: usize = 10000;
+        let mut counter = 0;
+
         let backoff = Backoff::new();
         loop {
             // fast check, without lock
@@ -167,7 +178,7 @@ impl Processor {
                 return Err(());
             }
 
-            if let Some(lock) = self.queue.try_lock() {
+            if let Some(lock) = self.queue.worker.try_lock() {
                 // check again after locking
                 if !ptr::eq(self.current_machine.load(Ordering::Relaxed), machine) {
                     drop(lock);
@@ -178,24 +189,28 @@ impl Processor {
             }
 
             if backoff.is_completed() {
-                thread::yield_now()
+                thread::yield_now();
+                counter += 1;
+                if counter > SPIN_THRESHOLD {
+                    panic!("stuck in spin loop, please fill an issue on github.com/win-t/lelet");
+                }
             } else {
-                backoff.snooze()
+                backoff.snooze();
             }
         }
     }
 
-    /// unlock the queue lock, run f, and then reacquire queue lock again,
+    /// unlock the worker lock, run f, and then reacquire worker lock again,
     #[inline(always)]
-    fn unlock_queue_and_then(
+    fn unlock_worker_and_then(
         &self,
         machine: &Machine,
-        lock: QueueLock,
+        lock: SpinlockGuard<'_, WorkerWrapper>,
         f: impl FnOnce(),
-    ) -> Result<QueueLock, ()> {
+    ) -> Result<SpinlockGuard<'_, WorkerWrapper>, ()> {
         drop(lock);
         f();
-        self.check_and_acquire_queue(machine)
+        self.check_machine_and_acquire_worker(machine)
     }
 
     #[inline(always)]
@@ -221,13 +236,13 @@ impl Processor {
         self.sleeper.wake_up()
     }
 
-    pub fn check_and_push(&self, machine: &Machine, task: Task) -> Result<(), Task> {
-        match self.check_and_acquire_queue(machine) {
-            Ok(mut queue) => {
+    pub fn check_machine_and_push(&self, machine: &Machine, task: Task) -> Result<(), Task> {
+        match self.check_machine_and_acquire_worker(machine) {
+            Ok(mut worker) => {
                 #[cfg(feature = "tracing")]
                 trace!("{:?} directly pushed to {:?} local queue", task.tag(), self);
 
-                queue.push(self.current_task.load(Ordering::Relaxed), task);
+                worker.push(self.current_task.load(Ordering::Relaxed), task);
                 machine.system.processors_wake_up();
 
                 Ok(())
@@ -255,32 +270,40 @@ impl std::fmt::Debug for Processor {
     }
 }
 
-struct WorkerWrapper(Option<Task>, Worker<Task>);
+struct WorkerWrapper {
+    prioritized: Option<Task>,
+    wrapped: Worker<Task>,
+}
 
 impl WorkerWrapper {
     fn new(worker: Worker<Task>) -> WorkerWrapper {
-        WorkerWrapper(None, worker)
+        WorkerWrapper {
+            prioritized: None,
+            wrapped: worker,
+        }
     }
 
     fn pop(&mut self) -> Option<Task> {
-        self.0.take().or_else(|| self.1.pop())
+        self.prioritized.take().or_else(|| self.wrapped.pop())
     }
 
     fn push(&mut self, current_task: *mut TaskTag, task: Task) {
         if ptr::eq(current_task, task.tag() as *const _ as *mut _) {
-            self.1.push(task)
+            // current task is scheduled when running,
+            // do not prioritize it
+            self.wrapped.push(task)
         } else {
             #[cfg(feature = "tracing")]
             trace!("{:?} is prioritized", task.tag());
 
-            if let Some(task) = self.0.replace(task) {
-                self.1.push(task)
+            if let Some(task) = self.prioritized.replace(task) {
+                self.wrapped.push(task)
             }
         }
     }
 
-    fn as_worker_ref(&mut self) -> &Worker<Task> {
-        &self.1
+    fn get_ref(&mut self) -> &Worker<Task> {
+        &self.wrapped
     }
 }
 
@@ -288,8 +311,6 @@ struct Queue {
     worker: Spinlock<WorkerWrapper>,
     stealer: Stealer<Task>,
 }
-
-type QueueLock<'a> = SpinlockGuard<'a, WorkerWrapper>;
 
 impl Queue {
     fn new() -> Queue {
@@ -299,9 +320,5 @@ impl Queue {
             worker: Spinlock::new(WorkerWrapper::new(worker)),
             stealer,
         }
-    }
-
-    fn try_lock(&self) -> Option<QueueLock> {
-        self.worker.try_lock()
     }
 }

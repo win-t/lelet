@@ -88,7 +88,7 @@ pub fn direct_push(task: Task) -> Result<(), Task> {
         let mut current = current.borrow_mut();
         match current.as_ref() {
             None => Err(task),
-            Some(m) => m.processor.check_and_push(m, task).map_err(|err| {
+            Some(m) => m.processor.check_machine_and_push(m, task).map_err(|err| {
                 current.take();
                 err
             }),
