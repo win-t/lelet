@@ -3,6 +3,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
+use std::thread;
 
 use crossbeam_utils::Backoff;
 
@@ -39,40 +40,26 @@ macro_rules! defer {
   };
 }
 
-pub struct Yields(usize);
-
-impl Yields {
-    pub fn new(times: usize) -> Yields {
-        Yields(times)
-    }
-}
+pub struct Yields(pub usize);
 
 impl Future for Yields {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if self.0 == 0 {
-            Poll::Ready(())
-        } else {
-            self.0 -= 1;
-            cx.waker().wake_by_ref();
-            Poll::Pending
+        match self.0 {
+            0 => Poll::Ready(()),
+            _ => {
+                self.0 -= 1;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
         }
     }
 }
 
-pub async fn yield_now() {
-    Yields(1).await;
-}
-
 /// A simple spinlock.
-///
-/// copied from [`crossbeam_channel`]`::utils`
-/// because it is private in that crate
-///
-/// [`crossbeam_channel`]: https://docs.rs/crossbeam-channel
 pub struct Spinlock<T: ?Sized> {
-    flag: AtomicBool,
+    locked: AtomicBool,
     value: UnsafeCell<T>,
 }
 
@@ -82,18 +69,34 @@ impl<T> Spinlock<T> {
     /// Returns a new spinlock initialized with `value`.
     pub fn new(value: T) -> Spinlock<T> {
         Spinlock {
-            flag: AtomicBool::new(false),
+            locked: AtomicBool::new(false),
             value: UnsafeCell::new(value),
         }
     }
 
+    /// Try to lock the spinlock.
+    #[inline(always)]
+    pub fn try_lock(&self) -> Option<SpinlockGuard<'_, T>> {
+        match self.locked.swap(true, Ordering::Acquire) {
+            true => None,
+            false => Some(SpinlockGuard { parent: self }),
+        }
+    }
+
     /// Locks the spinlock.
+    #[inline(always)]
     pub fn lock(&self) -> SpinlockGuard<'_, T> {
         let backoff = Backoff::new();
-        while self.flag.swap(true, Ordering::Acquire) {
-            backoff.snooze();
+        loop {
+            if let Some(guard) = self.try_lock() {
+                return guard;
+            }
+
+            match backoff.is_completed() {
+                true => thread::yield_now(),
+                false => backoff.snooze(),
+            }
         }
-        SpinlockGuard { parent: self }
     }
 }
 
@@ -104,20 +107,20 @@ pub struct SpinlockGuard<'a, T: 'a> {
 
 impl<'a, T> Drop for SpinlockGuard<'a, T> {
     fn drop(&mut self) {
-        self.parent.flag.store(false, Ordering::Release);
+        self.parent.locked.store(false, Ordering::Release);
     }
 }
 
 impl<'a, T> std::ops::Deref for SpinlockGuard<'a, T> {
     type Target = T;
 
-    fn deref(&self) -> &T {
+    fn deref(&self) -> &Self::Target {
         unsafe { &*self.parent.value.get() }
     }
 }
 
 impl<'a, T> std::ops::DerefMut for SpinlockGuard<'a, T> {
-    fn deref_mut(&mut self) -> &mut T {
+    fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { &mut *self.parent.value.get() }
     }
 }
