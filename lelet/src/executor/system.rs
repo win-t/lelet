@@ -1,5 +1,4 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
@@ -51,11 +50,9 @@ impl System {
         }
 
         // just to make sure that processor index is consistent
-        (0..num_cpus)
-            .zip(processors.iter())
-            .for_each(|(index, processor)| {
-                assert_eq!(processor.index, index);
-            });
+        for (i, p) in processors.iter().enumerate() {
+            assert_eq!(i, p.index);
+        }
 
         System {
             processors,
@@ -71,30 +68,24 @@ impl System {
         trace!("Sysmon is running");
 
         // spawn machine for every processor
-        self.processors
-            .iter()
-            .for_each(|p| machine::spawn(self, p.index));
+        self.processors.iter().for_each(|p| machine::spawn(self, p));
 
         loop {
             let check_tick = self.tick.fetch_add(1, Ordering::Relaxed) + 1;
 
             thread::sleep(BLOCKING_THRESHOLD);
 
-            let processors = self
-                .processors
+            self.processors
                 .iter()
-                .filter(|p| p.get_last_seen() < check_tick);
+                .filter(|p| p.get_last_seen() < check_tick)
+                .for_each(|p| {
+                    #[cfg(feature = "tracing")]
+                    trace!("{:?} was blocked, spawn new machine for it", p);
 
-            #[cfg(feature = "tracing")]
-            let processors = processors.map(|p| {
-                trace!("{:?} was blocked, replacing its machine", p);
-                p
-            });
-
-            processors.for_each(|p| machine::spawn(self, p.index));
+                    machine::spawn(self, p);
+                });
 
             if self.processors.iter().all(|p| p.is_sleeping()) {
-                // all processor is sleeping, also go to sleep
                 self.sleeper.sleep();
             }
         }
@@ -117,19 +108,19 @@ impl System {
     pub fn processors_wake_up(&self) {
         // wake up processor that unlikely to be stolen near future
         let mut index = self.steal_index_hint.load(Ordering::Relaxed) + self.processors.len() - 1;
-        while index >= self.processors.len() {
+        if index >= self.processors.len() {
             index -= self.processors.len();
         }
 
         let p = &self.processors[index];
-        let is_sleeping = p.is_sleeping();
+        let already_running = !p.is_sleeping();
 
         p.wake_up();
 
         // wake up another one, in case p need help
-        if !is_sleeping {
-            let (l, r) = self.processors.split_at(index + 1);
-            r.iter().chain(l.iter()).find(|p| p.wake_up());
+        if already_running {
+            let (l, r) = self.processors.split_at(index);
+            r.iter().chain(l.iter()).rev().find(|p| p.wake_up());
         }
     }
 
@@ -154,7 +145,7 @@ impl System {
             .find(|(_, s)| s.is_some())
             .map(|(hint_add, s)| {
                 let mut new_hint = hint + hint_add;
-                while new_hint >= self.processors.len() {
+                if new_hint >= self.processors.len() {
                     new_hint -= self.processors.len();
                 }
 
@@ -181,27 +172,32 @@ pub fn get() -> &'static System {
     &SYSTEM
 }
 
-static NUM_CPUS: Lazy<Mutex<(bool, usize)>> = Lazy::new(|| Mutex::new((false, 0)));
+static NUM_CPUS: AtomicUsize = AtomicUsize::new(0);
 
-pub fn set_num_cpus(size: usize) -> Result<usize, &'static str> {
-    let mut num_cpus = NUM_CPUS.lock().unwrap();
-    if num_cpus.0 {
-        return Err("cannot change num_cpus");
+/// set the number of executor thread
+///
+/// analogous to GOMAXPROCS in golang,
+/// can only be set once and before executor is running,
+/// if not set before executor running, it will be the number of available cpu in the host
+pub fn set_num_cpus(size: usize) -> Result<(), String> {
+    let old_value = NUM_CPUS.compare_and_swap(0, size, Ordering::Relaxed);
+    if old_value == 0 {
+        Ok(())
+    } else {
+        Err(format!("num_cpus already set to {}", old_value))
     }
-    let old = num_cpus.1;
-    num_cpus.1 = size;
-    Ok(old)
 }
 
+/// get the number of executor thread,
+/// 0 if executor is not run yet
 pub fn get_num_cpus() -> usize {
-    NUM_CPUS.lock().unwrap().1
+    NUM_CPUS.load(Ordering::Relaxed)
 }
 
 fn lock_num_cpus() -> usize {
-    let mut num_cpus = NUM_CPUS.lock().unwrap();
-    if num_cpus.1 == 0 {
-        num_cpus.1 = std::cmp::max(1, num_cpus::get());
+    let num_cpus = &NUM_CPUS;
+    if num_cpus.load(Ordering::Relaxed) == 0 {
+        num_cpus.compare_and_swap(0, std::cmp::max(1, num_cpus::get()), Ordering::Relaxed);
     }
-    num_cpus.0 = true;
-    num_cpus.1
+    num_cpus.load(Ordering::Relaxed)
 }

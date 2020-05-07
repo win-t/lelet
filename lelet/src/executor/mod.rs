@@ -14,7 +14,7 @@ mod processor;
 mod system;
 mod task;
 
-pub use machine::respawn as mark_blocking;
+pub use machine::spawn_for_current_processor as spawn_machine_for_current_processor;
 pub use system::get_num_cpus;
 pub use system::set_num_cpus;
 

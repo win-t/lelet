@@ -1,5 +1,8 @@
 use std::cell::RefCell;
+use std::marker::PhantomData;
 use std::rc::Rc;
+
+#[cfg(feature = "tracing")]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(feature = "tracing")]
@@ -10,14 +13,20 @@ use lelet_utils::defer;
 
 use crate::thread_pool;
 
+use super::processor::Processor;
 use super::system::System;
 use super::Task;
 
 /// Machine is the one who have OS thread
 pub struct Machine {
+    #[cfg(feature = "tracing")]
     pub id: usize,
+
     pub system: &'static System,
-    pub processor_index: usize,
+    pub processor: &'static Processor,
+
+    // !Send + !Sync
+    _marker: PhantomData<*mut ()>,
 }
 
 thread_local! {
@@ -25,13 +34,17 @@ thread_local! {
 }
 
 impl Machine {
-    fn new(system: &'static System, processor_index: usize) -> Rc<Machine> {
+    fn new(system: &'static System, processor: &'static Processor) -> Rc<Machine> {
+        #[cfg(feature = "tracing")]
         static MACHINE_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
         let machine = Machine {
+            #[cfg(feature = "tracing")]
             id: MACHINE_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+
             system,
-            processor_index,
+            processor,
+            _marker: PhantomData,
         };
 
         #[cfg(feature = "tracing")]
@@ -40,11 +53,11 @@ impl Machine {
         Rc::new(machine)
     }
 
-    fn run(self: Rc<Machine>) {
-        CURRENT.with(|m| m.borrow_mut().replace(self.clone()));
-        defer! { CURRENT.with(|m| { m.borrow_mut().take() }); }
+    fn run(self: &Rc<Machine>) {
+        CURRENT.with(|current| current.borrow_mut().replace(self.clone()));
+        defer! { CURRENT.with(|current| { current.borrow_mut().take() }); }
 
-        self.system.processors[self.processor_index].run_on(&self);
+        self.processor.run_on(self);
     }
 }
 
@@ -62,10 +75,10 @@ impl Drop for Machine {
     }
 }
 
-pub fn spawn(system: &'static System, processor_index: usize) {
+pub fn spawn(system: &'static System, processor: &'static Processor) {
     thread_pool::spawn_box(Box::new(move || {
         abort_on_panic(move || {
-            Machine::new(system, processor_index).run();
+            Machine::new(system, processor).run();
         })
     }));
 }
@@ -75,27 +88,25 @@ pub fn direct_push(task: Task) -> Result<(), Task> {
         let mut current = current.borrow_mut();
         match current.as_ref() {
             None => Err(task),
-            Some(m) => m.system.processors[m.processor_index]
-                .check_and_push(m, task)
-                .map_err(|err| {
-                    current.take();
-                    err
-                }),
+            Some(m) => m.processor.check_and_push(m, task).map_err(|err| {
+                current.take();
+                err
+            }),
         }
     })
 }
 
-pub fn respawn() {
+/// spawn new machine for current processor.
+///
+/// this is useful if you know that you are going to do blocking that longer
+/// than blocking threshold.
+pub fn spawn_for_current_processor() {
     CURRENT.with(|current| {
         if let Some(m) = current.borrow_mut().take() {
             #[cfg(feature = "tracing")]
-            trace!(
-                "{:?} giving up on {:?}",
-                m,
-                m.system.processors[m.processor_index]
-            );
+            trace!("{:?} giving up on {:?}", m, m.processor);
 
-            spawn(m.system, m.processor_index)
+            spawn(m.system, m.processor)
         }
     })
 }
