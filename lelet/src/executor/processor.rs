@@ -8,7 +8,7 @@ use crossbeam_utils::Backoff;
 #[cfg(feature = "tracing")]
 use log::trace;
 
-use lelet_utils::{Spinlock, SpinlockGuard};
+use lelet_utils::{SimpleLock, SimpleLockGuard};
 
 use crate::utils::Sleeper;
 
@@ -167,7 +167,7 @@ impl Processor {
     fn check_machine_and_acquire_worker(
         &self,
         machine: &Machine,
-    ) -> Result<SpinlockGuard<'_, WorkerWrapper>, ()> {
+    ) -> Result<SimpleLockGuard<'_, WorkerWrapper>, ()> {
         const SPIN_THRESHOLD: usize = 10000;
         let mut counter = 0;
 
@@ -205,9 +205,9 @@ impl Processor {
     fn unlock_worker_and_then(
         &self,
         machine: &Machine,
-        lock: SpinlockGuard<'_, WorkerWrapper>,
+        lock: SimpleLockGuard<'_, WorkerWrapper>,
         f: impl FnOnce(),
-    ) -> Result<SpinlockGuard<'_, WorkerWrapper>, ()> {
+    ) -> Result<SimpleLockGuard<'_, WorkerWrapper>, ()> {
         drop(lock);
         f();
         self.check_machine_and_acquire_worker(machine)
@@ -308,7 +308,7 @@ impl WorkerWrapper {
 }
 
 struct Queue {
-    worker: Spinlock<WorkerWrapper>,
+    worker: SimpleLock<WorkerWrapper>,
     stealer: Stealer<Task>,
 }
 
@@ -317,7 +317,7 @@ impl Queue {
         let worker = Worker::new_fifo();
         let stealer = worker.stealer();
         Queue {
-            worker: Spinlock::new(WorkerWrapper::new(worker)),
+            worker: SimpleLock::new(WorkerWrapper::new(worker)),
             stealer,
         }
     }
