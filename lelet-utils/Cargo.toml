@@ -1,7 +1,7 @@
 [package]
 name = "lelet-utils"
 description = "lelet utils"
-version = "0.1.5"
+version = "0.2.0"
 authors = ["Kurnia D Win <kurnia.d.win@gmail.com>"]
 edition = "2018"
 license = "GPL-3.0+"
@@ -11,4 +11,3 @@ homepage = "https://github.com/win-t/lelet"
 documentation = "https://docs.rs/lelet-utils"
 
 [dependencies]
-crossbeam-utils = "0.7.2"
