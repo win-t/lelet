@@ -1,4 +1,5 @@
 use std::cell::UnsafeCell;
+use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::mem::forget;
@@ -9,7 +10,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-/// call std::process::abort when f panic
+/// call [`abort`] when `f` panic
+///
+/// [`abort`]: https://doc.rust-lang.org/std/process/fn.abort.html
 pub fn abort_on_panic(f: impl FnOnce()) {
     struct Bomb;
 
@@ -46,7 +49,8 @@ macro_rules! defer {
   };
 }
 
-/// Future that will yield multiple time
+/// Future that will yield multiple times
+#[derive(Debug)]
 pub struct Yields(pub usize);
 
 impl Future for Yields {
@@ -82,11 +86,20 @@ impl<T> SimpleLock<T> {
     }
 }
 
+impl<T: ?Sized + Default> Default for SimpleLock<T> {
+    /// Creates a `SimpleLock<T>`, with the `Default` value for T.
+    fn default() -> SimpleLock<T> {
+        SimpleLock::new(Default::default())
+    }
+}
+
 impl<T: ?Sized> SimpleLock<T> {
     /// Try to lock.
     ///
-    /// Intentionally we don't povide lock, you can spin loop try_lock if you want.
-    /// You should use std::sync::Mutex if you need blocking lock.
+    /// Intentionally I don't povide lock, you can spin loop `try_lock` if you want.
+    /// You should use [`Mutex`] if you need blocking lock.
+    ///
+    /// [`Mutex`]: https://doc.rust-lang.org/std/sync/struct.Mutex.html
     #[inline(always)]
     pub fn try_lock(&self) -> Option<SimpleLockGuard<'_, T>> {
         if self.locked.swap(true, Ordering::Acquire) {
@@ -100,7 +113,18 @@ impl<T: ?Sized> SimpleLock<T> {
     }
 }
 
-/// A guard holding a simple locked.
+impl<T: ?Sized + fmt::Debug> fmt::Debug for SimpleLock<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.try_lock() {
+            Some(guard) => f.debug_tuple("SimpleLock").field(&&*guard).finish(),
+            None => f.write_str("SimpleLock(<locked>)"),
+        }
+    }
+}
+
+/// A guard holding a [`SimpleLock`].
+///
+/// [`SimpleLock`]: struct.SimpleLock.html
 pub struct SimpleLockGuard<'a, T: 'a + ?Sized> {
     parent: &'a SimpleLock<T>,
 
@@ -125,6 +149,12 @@ impl<T: ?Sized> Deref for SimpleLockGuard<'_, T> {
 impl<T: ?Sized> DerefMut for SimpleLockGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { &mut *self.parent.value.get() }
+    }
+}
+
+impl<T: ?Sized + fmt::Debug> fmt::Debug for SimpleLockGuard<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
     }
 }
 
