@@ -87,7 +87,6 @@ impl<T> SimpleLock<T> {
 }
 
 impl<T: ?Sized + Default> Default for SimpleLock<T> {
-    /// Creates a `SimpleLock<T>`, with the `Default` value for T.
     fn default() -> SimpleLock<T> {
         SimpleLock::new(Default::default())
     }
@@ -162,9 +161,11 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for SimpleLockGuard<'_, T> {
 pub fn block_on<F: Future>(mut f: F) -> F::Output {
     // originally copied from `extreme` (https://docs.rs/extreme)
 
+    #[allow(clippy::mutex_atomic)]
     #[derive(Default)]
     struct Parker(Mutex<bool>, Condvar);
 
+    #[allow(clippy::mutex_atomic)]
     impl Parker {
         fn unpark(self: &Parker) {
             *self.0.lock().unwrap() = true;

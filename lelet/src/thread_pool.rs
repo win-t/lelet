@@ -35,7 +35,6 @@ thread_local! {
 
 type Job = Box<dyn FnOnce() + Send>;
 
-// singleton: POOL
 struct Pool {
     base: Instant,
     next_exit: AtomicUsize,

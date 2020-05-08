@@ -300,6 +300,7 @@ impl WorkerWrapper {
         self.prioritized.take().or_else(|| self.wrapped.pop())
     }
 
+    #[allow(clippy::collapsible_if)]
     fn push(&mut self, current_task: *mut TaskTag, task: Task) {
         if ptr::eq(current_task, task.tag() as *const _ as *mut _) {
             // current task is rescheduled when running, do not prioritize it
