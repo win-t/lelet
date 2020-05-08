@@ -100,7 +100,7 @@ pub fn direct_push(task: Task) -> Result<(), Task> {
 ///
 /// this is useful if you know that you are going to do blocking that longer
 /// than blocking threshold.
-pub fn spawn_for_current_processor() {
+pub fn mark_blocking() {
     CURRENT.with(|current| {
         if let Some(m) = current.borrow_mut().take() {
             #[cfg(feature = "tracing")]

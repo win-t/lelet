@@ -80,7 +80,7 @@ impl System {
                 .filter(|p| p.get_last_seen() < check_tick)
                 .for_each(|p| {
                     #[cfg(feature = "tracing")]
-                    trace!("{:?} was blocked, spawn new machine for it", p);
+                    trace!("{:?} is blocked, spawn new machine for it", p);
 
                     machine::spawn(self, p);
                 });

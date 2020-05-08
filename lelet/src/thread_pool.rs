@@ -1,3 +1,8 @@
+//! Thread pool
+//!
+//! The size of thread pool is unbounded, it will always spawn new thread
+//! when no thread available to run the job
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -11,7 +16,7 @@ use std::cell::Cell;
 #[cfg(feature = "tracing")]
 use log::trace;
 
-const IDLE_THRESHOLD: Duration = Duration::from_secs(60);
+const IDLE_THRESHOLD: Duration = Duration::from_secs(300); // 5 minutes
 
 #[cfg(feature = "tracing")]
 pub struct ThreadID(Cell<usize>);
@@ -114,6 +119,7 @@ impl Pool {
     }
 }
 
+/// Spawn the job in the thread pool
 pub fn spawn_box(job: Job) {
     static POOL: Lazy<Pool> = Lazy::new(Pool::new);
     POOL.put_job(job);

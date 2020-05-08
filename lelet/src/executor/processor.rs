@@ -75,6 +75,7 @@ impl Processor {
         const MAX_RUNS: usize = 61;
         let mut run_counter = 0;
 
+        let backoff = Backoff::new();
         loop {
             macro_rules! run_task {
                 ($task:expr) => {
@@ -155,7 +156,7 @@ impl Processor {
             run_stolen_task!();
 
             // 3.a. no more task for now, just sleep
-            self.sleep(machine);
+            self.sleep(machine, &backoff);
 
             // 3.b. after sleep, pop from global queue
             run_global_task!();
@@ -209,7 +210,9 @@ impl Processor {
         f: impl FnOnce(),
     ) -> Result<SimpleLockGuard<'_, WorkerWrapper>, ()> {
         drop(lock);
+
         f();
+
         self.check_machine_and_acquire_worker(machine)
     }
 
@@ -223,13 +226,19 @@ impl Processor {
         self.sleeping.load(Ordering::Relaxed)
     }
 
-    fn sleep(&self, machine: &Machine) {
-        self.sleeping.store(true, Ordering::Relaxed);
-        self.sleeper.sleep();
-        self.sleeping.store(false, Ordering::Relaxed);
+    fn sleep(&self, machine: &Machine, backoff: &Backoff) {
+        if backoff.is_completed() {
+            self.sleeping.store(true, Ordering::Relaxed);
+            self.sleeper.sleep();
+            self.sleeping.store(false, Ordering::Relaxed);
 
-        // wake the sysmon in case the sysmon is also sleeping
-        machine.system.sysmon_wake_up();
+            // wake the sysmon in case the sysmon is also sleeping
+            machine.system.sysmon_wake_up();
+
+            backoff.reset();
+        } else {
+            backoff.snooze();
+        }
     }
 
     pub fn wake_up(&self) -> bool {
@@ -240,7 +249,11 @@ impl Processor {
         match self.check_machine_and_acquire_worker(machine) {
             Ok(mut worker) => {
                 #[cfg(feature = "tracing")]
-                trace!("{:?} directly pushed to {:?} local queue", task.tag(), self);
+                trace!(
+                    "{:?} directly pushed to {:?}'s local queue",
+                    task.tag(),
+                    self
+                );
 
                 worker.push(self.current_task.load(Ordering::Relaxed), task);
                 machine.system.processors_wake_up();
@@ -289,8 +302,7 @@ impl WorkerWrapper {
 
     fn push(&mut self, current_task: *mut TaskTag, task: Task) {
         if ptr::eq(current_task, task.tag() as *const _ as *mut _) {
-            // current task is scheduled when running,
-            // do not prioritize it
+            // current task is rescheduled when running, do not prioritize it
             self.wrapped.push(task)
         } else {
             #[cfg(feature = "tracing")]
