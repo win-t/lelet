@@ -156,7 +156,15 @@ impl Processor {
             run_stolen_task!();
 
             // 3.a. no more task for now, just sleep
-            self.sleep(machine, &backoff);
+            worker = match self.unlock_worker_and_then(machine, worker, || {
+                self.sleep(machine, &backoff);
+            }) {
+                Some(worker) => worker,
+                None => {
+                    self.wake_up();
+                    return;
+                }
+            };
 
             // 3.b. after sleep, pop from global queue
             run_global_task!();
