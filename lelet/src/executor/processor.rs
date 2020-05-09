@@ -60,8 +60,8 @@ impl Processor {
             .store(machine as *const _ as *mut _, Ordering::Relaxed);
 
         let mut worker = match self.check_machine_and_acquire_worker(machine) {
-            Ok(worker) => worker,
-            Err(()) => return,
+            Some(worker) => worker,
+            None => return,
         };
 
         self.last_seen.store(u64::MAX, Ordering::Relaxed);
@@ -94,8 +94,8 @@ impl Processor {
                     worker = match self.unlock_worker_and_then(machine, worker, || {
                         $task.run();
                     }) {
-                        Ok(worker) => worker,
-                        Err(()) => {
+                        Some(worker) => worker,
+                        None => {
                             #[cfg(feature = "tracing")]
                             trace!("{} is done blocking {:?}", task_info, machine);
 
@@ -168,7 +168,7 @@ impl Processor {
     fn check_machine_and_acquire_worker(
         &self,
         machine: &Machine,
-    ) -> Result<SimpleLockGuard<'_, WorkerWrapper>, ()> {
+    ) -> Option<SimpleLockGuard<'_, WorkerWrapper>> {
         const SPIN_THRESHOLD: usize = 10000;
         let mut counter = 0;
 
@@ -176,17 +176,17 @@ impl Processor {
         loop {
             // fast check, without lock
             if !ptr::eq(self.current_machine.load(Ordering::Relaxed), machine) {
-                return Err(());
+                return None;
             }
 
             if let Some(lock) = self.queue.worker.try_lock() {
                 // check again after locking
                 if !ptr::eq(self.current_machine.load(Ordering::Relaxed), machine) {
                     drop(lock);
-                    return Err(());
+                    return None;
                 }
 
-                return Ok(lock);
+                return Some(lock);
             }
 
             if backoff.is_completed() {
@@ -208,7 +208,7 @@ impl Processor {
         machine: &Machine,
         lock: SimpleLockGuard<'_, WorkerWrapper>,
         f: impl FnOnce(),
-    ) -> Result<SimpleLockGuard<'_, WorkerWrapper>, ()> {
+    ) -> Option<SimpleLockGuard<'_, WorkerWrapper>> {
         drop(lock);
 
         f();
@@ -247,7 +247,7 @@ impl Processor {
 
     pub fn check_machine_and_push(&self, machine: &Machine, task: Task) -> Result<(), Task> {
         match self.check_machine_and_acquire_worker(machine) {
-            Ok(mut worker) => {
+            Some(mut worker) => {
                 #[cfg(feature = "tracing")]
                 trace!(
                     "{:?} directly pushed to {:?}'s local queue",
@@ -260,7 +260,7 @@ impl Processor {
 
                 Ok(())
             }
-            Err(()) => Err(task),
+            None => Err(task),
         }
     }
 
