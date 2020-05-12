@@ -88,7 +88,7 @@ impl<T> SimpleLock<T> {
 
 impl<T: ?Sized + Default> Default for SimpleLock<T> {
     fn default() -> SimpleLock<T> {
-        SimpleLock::new(Default::default())
+        SimpleLock::new(T::default())
     }
 }
 

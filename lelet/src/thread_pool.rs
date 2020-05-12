@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
+use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TrySendError};
 use once_cell::sync::Lazy;
 
 #[cfg(feature = "tracing")]
@@ -89,7 +89,7 @@ impl Pool {
                     });
                 }
 
-                _ => {
+                Err(RecvTimeoutError::Timeout) => {
                     let now = Instant::now();
                     let next_exit = self.next_exit.load(Ordering::Relaxed);
                     if now.duration_since(self.base).as_secs() as usize >= next_exit {
@@ -113,6 +113,9 @@ impl Pool {
                         }
                     }
                 }
+
+                // we hold both side of the channel
+                Err(RecvTimeoutError::Disconnected) => unreachable!(),
             }
         }
     }

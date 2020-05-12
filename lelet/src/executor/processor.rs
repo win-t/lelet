@@ -256,14 +256,30 @@ impl Processor {
     pub fn check_machine_and_push(&self, machine: &Machine, task: Task) -> Result<(), Task> {
         match self.check_machine_and_acquire_worker(machine) {
             Some(mut worker) => {
-                #[cfg(feature = "tracing")]
-                trace!(
-                    "{:?} directly pushed to {:?}'s local queue",
-                    task.tag(),
-                    self
+                // if current task is rescheduled when running, do not prioritize it
+                let prioritized = !ptr::eq(
+                    self.current_task.load(Ordering::Relaxed),
+                    task.tag() as *const _ as *mut _,
                 );
 
-                worker.push(self.current_task.load(Ordering::Relaxed), task);
+                #[cfg(feature = "tracing")]
+                {
+                    if prioritized {
+                        trace!(
+                            "{:?} directly pushed to {:?}'s local queue (prioritized)",
+                            task.tag(),
+                            self
+                        );
+                    } else {
+                        trace!(
+                            "{:?} directly pushed to {:?}'s local queue",
+                            task.tag(),
+                            self
+                        );
+                    }
+                }
+
+                worker.push(prioritized, task);
                 machine.system.processors_wake_up();
 
                 Ok(())
@@ -308,18 +324,13 @@ impl WorkerWrapper {
         self.prioritized.take().or_else(|| self.wrapped.pop())
     }
 
-    #[allow(clippy::collapsible_if)]
-    fn push(&mut self, current_task: *mut TaskTag, task: Task) {
-        if ptr::eq(current_task, task.tag() as *const _ as *mut _) {
-            // current task is rescheduled when running, do not prioritize it
-            self.wrapped.push(task)
-        } else {
-            #[cfg(feature = "tracing")]
-            trace!("{:?} is prioritized", task.tag());
-
+    fn push(&mut self, prioritized: bool, task: Task) {
+        if prioritized {
             if let Some(task) = self.prioritized.replace(task) {
                 self.wrapped.push(task)
             }
+        } else {
+            self.wrapped.push(task)
         }
     }
 
