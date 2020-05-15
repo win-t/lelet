@@ -159,28 +159,6 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for SimpleLockGuard<'_, T> {
 
 /// block current thread until f is complete
 pub fn block_on<F: Future>(mut f: F) -> F::Output {
-    // originally copied from `extreme` (https://docs.rs/extreme)
-
-    #[allow(clippy::mutex_atomic)]
-    #[derive(Default)]
-    struct Parker(Mutex<bool>, Condvar);
-
-    #[allow(clippy::mutex_atomic)]
-    impl Parker {
-        fn unpark(self: &Parker) {
-            *self.0.lock().unwrap() = true;
-            self.1.notify_one();
-        }
-
-        fn park(self: &Parker) {
-            let mut runnable = self.0.lock().unwrap();
-            while !*runnable {
-                runnable = self.1.wait(runnable).unwrap();
-            }
-            *runnable = false;
-        }
-    }
-
     static VTABLE: RawWakerVTable = RawWakerVTable::new(
         //
         // clone: unsafe fn(*const ()) -> RawWaker
@@ -217,5 +195,29 @@ pub fn block_on<F: Future>(mut f: F) -> F::Output {
             Poll::Pending => parker.park(),
             Poll::Ready(val) => return val,
         }
+    }
+}
+
+/// alternative of std [`park`]/[`unpark`]
+///
+/// [`park`]: https://doc.rust-lang.org/std/thread/fn.park.html
+/// [`unpark`]: https://doc.rust-lang.org/std/thread/struct.Thread.html#method.unpark
+#[allow(clippy::mutex_atomic)]
+#[derive(Default)]
+pub struct Parker(Mutex<bool>, Condvar);
+
+#[allow(clippy::mutex_atomic)]
+impl Parker {
+    pub fn unpark(self: &Parker) {
+        *self.0.lock().unwrap() = true;
+        self.1.notify_one();
+    }
+
+    pub fn park(self: &Parker) {
+        let mut runnable = self.0.lock().unwrap();
+        while !*runnable {
+            runnable = self.1.wait(runnable).unwrap();
+        }
+        *runnable = false;
     }
 }
