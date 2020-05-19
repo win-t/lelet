@@ -107,7 +107,7 @@ impl System {
 
     pub fn processors_wake_up(&self) {
         // wake up processor that unlikely to be stolen near future
-        let mut index = self.steal_index_hint.load(Ordering::Relaxed) + self.processors.len() - 1;
+        let mut index = self.recalc_steal_index_hint(0) + self.processors.len() - 1;
         if index >= self.processors.len() {
             index -= self.processors.len();
         }
