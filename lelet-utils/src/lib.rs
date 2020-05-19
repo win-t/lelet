@@ -50,6 +50,16 @@ macro_rules! defer {
   };
 }
 
+#[macro_export]
+macro_rules! ready {
+    ($e:expr $(,)?) => {
+        match $e {
+            Poll::Ready(t) => t,
+            Poll::Pending => return Poll::Pending,
+        }
+    };
+}
+
 /// Future that will yield multiple times
 #[derive(Debug)]
 pub struct Yields(pub usize);
