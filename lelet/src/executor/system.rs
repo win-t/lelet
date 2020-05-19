@@ -136,22 +136,29 @@ impl System {
             .flatten()
     }
 
+    #[inline(always)]
+    fn recalc_steal_index_hint(&self, add: usize) -> usize {
+        let old_hint = self.steal_index_hint.fetch_add(add, Ordering::Relaxed);
+        if old_hint < self.processors.len() {
+            return old_hint;
+        }
+
+        let hint = old_hint % self.processors.len();
+        self.steal_index_hint
+            .compare_and_swap(old_hint + add, hint + add, Ordering::Relaxed);
+
+        hint
+    }
+
     pub fn steal(&self, worker: &Worker<Task>) -> Option<Task> {
-        let hint = self.steal_index_hint.load(Ordering::Relaxed);
-        let (l, r) = self.processors.split_at(hint);
-        (1..)
-            .zip(r.iter().chain(l.iter()))
-            .map(|(hint_add, p)| (hint_add, p.steal(worker)))
+        let (l, r) = self.processors.split_at(self.recalc_steal_index_hint(1));
+        (r.iter().chain(l.iter()).enumerate())
+            .map(|(i, p)| (i, p.steal(worker)))
             .find(|(_, s)| s.is_some())
-            .map(|(hint_add, s)| {
-                let mut new_hint = hint + hint_add;
-                if new_hint >= self.processors.len() {
-                    new_hint -= self.processors.len();
+            .map(|(i, s)| {
+                if i != 0 {
+                    self.recalc_steal_index_hint(i);
                 }
-
-                self.steal_index_hint
-                    .compare_and_swap(hint, new_hint, Ordering::Relaxed);
-
                 s
             })
             .flatten()

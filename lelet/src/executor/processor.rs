@@ -177,10 +177,6 @@ impl Processor {
         &self,
         machine: &Machine,
     ) -> Option<SimpleLockGuard<'_, WorkerWrapper>> {
-        const SPIN_THRESHOLD: usize = 10000;
-        let mut counter = 0;
-
-        let backoff = Backoff::new();
         loop {
             // fast check, without lock
             if !ptr::eq(self.current_machine.load(Ordering::Relaxed), machine) {
@@ -197,15 +193,7 @@ impl Processor {
                 return Some(lock);
             }
 
-            if backoff.is_completed() {
-                thread::yield_now();
-                counter += 1;
-                if counter > SPIN_THRESHOLD {
-                    panic!("stuck in spin loop, please fill an issue on github.com/win-t/lelet");
-                }
-            } else {
-                backoff.snooze();
-            }
+            thread::yield_now();
         }
     }
 
