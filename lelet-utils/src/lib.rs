@@ -6,9 +6,10 @@ use std::mem::forget;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::process::abort;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use std::time::Duration;
 
 /// call [`abort`] when `f` panic
 ///
@@ -68,6 +69,11 @@ impl Future for Yields {
 }
 
 /// A simple lock.
+///
+/// Intentionally I don't povide `lock`, you can spin loop `try_lock` if you want.
+/// You should use [`Mutex`] if you need blocking lock.
+///
+/// [`Mutex`]: https://doc.rust-lang.org/std/sync/struct.Mutex.html
 pub struct SimpleLock<T: ?Sized> {
     locked: AtomicBool,
     value: UnsafeCell<T>,
@@ -94,11 +100,6 @@ impl<T: ?Sized + Default> Default for SimpleLock<T> {
 
 impl<T: ?Sized> SimpleLock<T> {
     /// Try to lock.
-    ///
-    /// Intentionally I don't povide lock, you can spin loop `try_lock` if you want.
-    /// You should use [`Mutex`] if you need blocking lock.
-    ///
-    /// [`Mutex`]: https://doc.rust-lang.org/std/sync/struct.Mutex.html
     #[inline(always)]
     pub fn try_lock(&self) -> Option<SimpleLockGuard<'_, T>> {
         if self.locked.swap(true, Ordering::Acquire) {
@@ -198,26 +199,121 @@ pub fn block_on<F: Future>(mut f: F) -> F::Output {
     }
 }
 
+// Parker is copied from crossbeam_utils::sync::Inner
+
 /// alternative of std [`park`]/[`unpark`]
 ///
 /// [`park`]: https://doc.rust-lang.org/std/thread/fn.park.html
 /// [`unpark`]: https://doc.rust-lang.org/std/thread/struct.Thread.html#method.unpark
-#[allow(clippy::mutex_atomic)]
 #[derive(Default)]
-pub struct Parker(Mutex<bool>, Condvar);
+pub struct Parker {
+    state: AtomicUsize,
+    lock: Mutex<()>,
+    cvar: Condvar,
+}
 
-#[allow(clippy::mutex_atomic)]
+const EMPTY: usize = 0;
+const PARKED: usize = 1;
+const NOTIFIED: usize = 2;
+
 impl Parker {
-    pub fn unpark(self: &Parker) {
-        *self.0.lock().unwrap() = true;
-        self.1.notify_one();
+    pub fn park(&self) {
+        self.park_timeout(None);
     }
 
-    pub fn park(self: &Parker) {
-        let mut runnable = self.0.lock().unwrap();
-        while !*runnable {
-            runnable = self.1.wait(runnable).unwrap();
+    #[allow(clippy::single_match)]
+    pub fn park_timeout(&self, timeout: Option<Duration>) {
+        // If we were previously notified then we consume this notification and return quickly.
+        if self
+            .state
+            .compare_exchange(NOTIFIED, EMPTY, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return;
         }
-        *runnable = false;
+
+        // If the timeout is zero, then there is no need to actually block.
+        if let Some(ref dur) = timeout {
+            if *dur == Duration::from_millis(0) {
+                return;
+            }
+        }
+
+        // Otherwise we need to coordinate going to sleep.
+        let mut m = self.lock.lock().unwrap();
+
+        match self
+            .state
+            .compare_exchange(EMPTY, PARKED, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => {}
+            // Consume this notification to avoid spurious wakeups in the next park.
+            Err(NOTIFIED) => {
+                // We must read `state` here, even though we know it will be `NOTIFIED`. This is
+                // because `unpark` may have been called again since we read `NOTIFIED` in the
+                // `compare_exchange` above. We must perform an acquire operation that synchronizes
+                // with that `unpark` to observe any writes it made before the call to `unpark`. To
+                // do that we must read from the write it made to `state`.
+                let old = self.state.swap(EMPTY, Ordering::SeqCst);
+                assert_eq!(old, NOTIFIED, "park state changed unexpectedly");
+                return;
+            }
+            Err(n) => panic!("inconsistent park_timeout state: {}", n),
+        }
+
+        match timeout {
+            None => {
+                loop {
+                    // Block the current thread on the conditional variable.
+                    m = self.cvar.wait(m).unwrap();
+
+                    match self.state.compare_exchange(
+                        NOTIFIED,
+                        EMPTY,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ) {
+                        Ok(_) => return, // got a notification
+                        Err(_) => {}     // spurious wakeup, go back to sleep
+                    }
+                }
+            }
+            Some(timeout) => {
+                // Wait with a timeout, and if we spuriously wake up or otherwise wake up from a
+                // notification we just want to unconditionally set `state` back to `EMPTY`, either
+                // consuming a notification or un-flagging ourselves as parked.
+                let (_m, _result) = self.cvar.wait_timeout(m, timeout).unwrap();
+
+                match self.state.swap(EMPTY, Ordering::SeqCst) {
+                    NOTIFIED => {} // got a notification
+                    PARKED => {}   // no notification
+                    n => panic!("inconsistent park_timeout state: {}", n),
+                }
+            }
+        }
+    }
+
+    pub fn unpark(&self) {
+        // To ensure the unparked thread will observe any writes we made before this call, we must
+        // perform a release operation that `park` can synchronize with. To do that we must write
+        // `NOTIFIED` even if `state` is already `NOTIFIED`. That is why this must be a swap rather
+        // than a compare-and-swap that returns if it reads `NOTIFIED` on failure.
+        match self.state.swap(NOTIFIED, Ordering::SeqCst) {
+            EMPTY => return,    // no one was waiting
+            NOTIFIED => return, // already unparked
+            PARKED => {}        // gotta go wake someone up
+            _ => panic!("inconsistent state in unpark"),
+        }
+
+        // There is a period between when the parked thread sets `state` to `PARKED` (or last
+        // checked `state` in the case of a spurious wakeup) and when it actually waits on `cvar`.
+        // If we were to notify during this period it would be ignored and then when the parked
+        // thread went to sleep it would never wake up. Fortunately, it has `lock` locked at this
+        // stage so we can acquire `lock` to wait until it is ready to receive the notification.
+        //
+        // Releasing `lock` before the call to `notify_one` means that when the parked thread wakes
+        // it doesn't get woken only to have to wait for us to release `lock`.
+        drop(self.lock.lock().unwrap());
+        self.cvar.notify_one();
     }
 }
