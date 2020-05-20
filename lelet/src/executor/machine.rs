@@ -23,7 +23,7 @@ pub struct Machine {
     pub id: usize,
 
     pub system: &'static System,
-    pub processor: &'static Processor,
+    processor: &'static Processor,
 
     // !Send + !Sync
     _marker: PhantomData<*mut ()>,
@@ -34,7 +34,7 @@ thread_local! {
 }
 
 impl Machine {
-    fn new(system: &'static System, processor: &'static Processor) -> Rc<Machine> {
+    fn new(system: &'static System, index: usize) -> Rc<Machine> {
         #[cfg(feature = "tracing")]
         static MACHINE_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -43,7 +43,8 @@ impl Machine {
             id: MACHINE_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
 
             system,
-            processor,
+            processor: &system.processors[index],
+
             _marker: PhantomData,
         };
 
@@ -76,10 +77,10 @@ impl Drop for Machine {
     }
 }
 
-pub fn spawn(system: &'static System, processor: &'static Processor) {
+pub fn spawn(system: &'static System, index: usize) {
     thread_pool::spawn_box(Box::new(move || {
         abort_on_panic(move || {
-            Machine::new(system, processor).run();
+            Machine::new(system, index).run();
         })
     }));
 }
@@ -92,7 +93,7 @@ pub fn direct_push(task: Task) -> Result<usize, Task> {
             None => Err(task),
             Some(m) => m
                 .processor
-                .direct_push(m, task)
+                .push_local(m, task)
                 .map(|()| m.processor.index)
                 .map_err(|err| {
                     current.take();
@@ -106,9 +107,13 @@ pub fn respawn() {
     CURRENT.with(|current| {
         if let Some(m) = current.borrow_mut().take() {
             #[cfg(feature = "tracing")]
-            trace!("{:?} giving up on {:?}", m, m.processor);
+            trace!(
+                "{:?} is giving up on {:?}, spawn new machine",
+                m,
+                m.processor
+            );
 
-            spawn(m.system, m.processor)
+            spawn(m.system, m.processor.index)
         }
     })
 }

@@ -15,10 +15,10 @@ mod processor;
 mod system;
 mod task;
 
-pub use system::mark_blocking;
-
 pub use system::get_num_cpus;
 pub use system::set_num_cpus;
+
+pub use system::mark_blocking;
 
 use std::future::Future;
 use std::pin::Pin;

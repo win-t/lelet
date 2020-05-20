@@ -44,8 +44,6 @@ mod executor;
 pub use executor::spawn;
 pub use executor::JoinHandle;
 
-mod utils;
-
 #[doc(hidden)]
 pub use executor::get_num_cpus;
 #[doc(hidden)]

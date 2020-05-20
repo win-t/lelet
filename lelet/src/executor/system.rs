@@ -9,9 +9,7 @@ use once_cell::sync::Lazy;
 #[cfg(feature = "tracing")]
 use log::trace;
 
-use lelet_utils::abort_on_panic;
-
-use crate::utils::{atomic_usize_add_mod, coprime, Sleeper};
+use lelet_utils::{abort_on_panic, Parker};
 
 use super::machine;
 use super::processor::Processor;
@@ -30,7 +28,7 @@ pub struct System {
     push_hint: AtomicUsize,
     steal_hint: Vec<(CachePadded<AtomicUsize>, Vec<usize>)>,
 
-    sleeper: Sleeper,
+    parker: Parker,
 }
 
 // just to make sure
@@ -52,22 +50,21 @@ impl System {
 
         let steal_hint: Vec<(CachePadded<AtomicUsize>, Vec<usize>)> = (3..)
             .step_by(2)
-            .filter(|i| coprime(*i, num_cpus))
+            .filter(|&i| coprime(i, num_cpus))
             .take(num_cpus)
             .enumerate()
             .map(|(i, c)| {
                 (0..num_cpus)
                     .map(move |j| ((c * j) + i) % num_cpus)
-                    .filter(move |s| *s != i)
+                    .filter(move |&s| s != i)
                     .collect()
             })
-            .map(|o| (CachePadded::default(), o))
+            .map(|o| (CachePadded::new(AtomicUsize::new(0)), o))
             .collect();
 
         // just to make sure that steal_hint are valid
         let sum: usize = (0..num_cpus).sum();
         for (i, s) in steal_hint.iter().enumerate() {
-            assert!(s.1.iter().all(|&x| x != i));
             assert_eq!(sum, i + s.1.iter().sum::<usize>());
         }
 
@@ -77,7 +74,7 @@ impl System {
 
             tick: AtomicU64::new(0),
             push_hint: AtomicUsize::new(0),
-            sleeper: Sleeper::new(),
+            parker: Parker::default(),
         }
     }
 
@@ -87,42 +84,45 @@ impl System {
         trace!("Sysmon is running");
 
         // spawn machine for every processor
-        self.processors.iter().for_each(|p| machine::spawn(self, p));
+        self.processors
+            .iter()
+            .for_each(|p| machine::spawn(self, p.index));
 
         loop {
-            let check_tick = self.tick.fetch_add(1, Ordering::Relaxed) + 1;
-
-            thread::sleep(BLOCKING_THRESHOLD);
-
-            self.processors
-                .iter()
-                .filter(|p| p.get_last_seen() < check_tick)
-                .for_each(|p| {
-                    #[cfg(feature = "tracing")]
-                    trace!("{:?} is blocked, spawn new machine for it", p);
-
-                    machine::spawn(self, p);
-                });
-
             if self.processors.iter().all(|p| p.is_sleeping()) {
-                self.sleeper.sleep();
+                self.parker.park();
+            } else {
+                let check_tick = self.tick.fetch_add(1, Ordering::Relaxed) + 1;
+
+                thread::sleep(BLOCKING_THRESHOLD);
+
+                if !self.processors.iter().any(|p| p.is_sleeping()) {
+                    self.processors
+                        .iter()
+                        .filter(|p| p.get_last_seen() < check_tick)
+                        .for_each(|p| {
+                            #[cfg(feature = "tracing")]
+                            trace!("{:?} is blocked, spawn new machine for it", p);
+
+                            machine::spawn(self, p.index);
+                        });
+                }
             }
         }
     }
 
     #[inline(always)]
     pub fn sysmon_wake_up(&self) {
-        self.sleeper.wake_up();
+        self.parker.unpark();
     }
 
     #[inline(always)]
     pub fn push(&self, task: Task) {
         match machine::direct_push(task) {
             Ok(mut index) => {
-                if index == self.processors.len() - 1 {
+                index += 1;
+                if index == self.processors.len() {
                     index = 0;
-                } else {
-                    index += 1;
                 }
                 self.processors[index].wake_up();
             }
@@ -131,18 +131,20 @@ impl System {
                 if index >= self.processors.len() {
                     index = atomic_usize_add_mod(&self.push_hint, 1, self.processors.len());
                 }
+
                 let p = &self.processors[index];
-                p.push(task);
+
+                p.push_global(task);
                 p.wake_up();
             }
         };
     }
 
     #[inline(always)]
-    pub fn pop(&self, worker: &Worker<Task>, index: usize) -> Option<Task> {
-        let (l, r) = self.processors.split_at(index);
-        for p in r.iter().chain(l.iter()) {
-            if let Some(task) = p.pop(worker) {
+    pub fn pop(&self, worker: &Worker<Task>, processor: &Processor) -> Option<Task> {
+        let (_, steal_order) = &self.steal_hint[processor.index];
+        for &i in std::iter::once(&processor.index).chain(steal_order.iter()) {
+            if let Some(task) = self.processors[i].pop_global(worker) {
                 return Some(task);
             }
         }
@@ -150,11 +152,14 @@ impl System {
     }
 
     #[inline(always)]
-    pub fn steal(&self, worker: &Worker<Task>, index: usize) -> Option<Task> {
-        let (steal_index, steal_order) = &self.steal_hint[index];
+    pub fn steal(&self, worker: &Worker<Task>, processor: &Processor) -> Option<Task> {
+        if self.processors.len() == 1 {
+            return None;
+        }
+        let (steal_index, steal_order) = &self.steal_hint[processor.index];
         let (l, r) = steal_order.split_at(atomic_usize_add_mod(steal_index, 1, steal_order.len()));
-        for (add, &index) in r.iter().chain(l.iter()).enumerate() {
-            if let Some(task) = self.processors[index].steal(worker) {
+        for (add, &i) in (r.iter().chain(l.iter())).enumerate() {
+            if let Some(task) = self.processors[i].steal_local(worker) {
                 atomic_usize_add_mod(steal_index, add, steal_order.len());
                 return Some(task);
             }
@@ -178,12 +183,14 @@ pub fn get() -> &'static System {
     &SYSTEM
 }
 
-/// spawn new machine for current processor.
+/// Mark current processor as blocking
 ///
 /// this is useful if you know that you are going to do blocking that longer
 /// than blocking threshold.
 pub fn mark_blocking() {
-    machine::respawn();
+    if !get().processors.iter().any(|p| p.is_sleeping()) {
+        machine::respawn();
+    }
 }
 
 static NUM_CPUS: AtomicUsize = AtomicUsize::new(0);
@@ -214,4 +221,30 @@ fn lock_num_cpus() -> usize {
         num_cpus.compare_and_swap(0, std::cmp::max(1, num_cpus::get()), Ordering::Relaxed);
     }
     num_cpus.load(Ordering::Relaxed)
+}
+
+#[inline(always)]
+pub fn atomic_usize_add_mod(p: &AtomicUsize, i: usize, m: usize) -> usize {
+    let value = p.fetch_add(i, Ordering::Relaxed);
+    if value < m {
+        value
+    } else {
+        let new_value = value % m;
+        p.compare_and_swap(value + i, new_value + i, Ordering::Relaxed);
+        new_value
+    }
+}
+
+#[inline(always)]
+pub fn coprime(a: usize, b: usize) -> bool {
+    gcd(a, b) == 1
+}
+
+#[inline(always)]
+pub fn gcd(a: usize, b: usize) -> usize {
+    let mut p = (a, b);
+    while p.1 != 0 {
+        p = (p.1, p.0 % p.1);
+    }
+    p.0
 }
