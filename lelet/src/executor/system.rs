@@ -2,7 +2,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use crossbeam_deque::{Injector, Steal, Worker};
+use crossbeam_deque::Worker;
+use crossbeam_utils::CachePadded;
 use once_cell::sync::Lazy;
 
 #[cfg(feature = "tracing")]
@@ -10,7 +11,7 @@ use log::trace;
 
 use lelet_utils::abort_on_panic;
 
-use crate::utils::Sleeper;
+use crate::utils::{atomic_usize_add_mod, coprime, Sleeper};
 
 use super::machine;
 use super::processor::Processor;
@@ -23,13 +24,11 @@ pub struct System {
     /// all processors
     pub processors: Vec<Processor>,
 
-    /// global queue
-    injector: Injector<Task>,
-
-    steal_index_hint: AtomicUsize,
-
     /// for blocking detection
     tick: AtomicU64,
+
+    push_hint: AtomicUsize,
+    steal_hint: Vec<(CachePadded<AtomicUsize>, Vec<usize>)>,
 
     sleeper: Sleeper,
 }
@@ -44,25 +43,45 @@ impl Drop for System {
 
 impl System {
     fn new(num_cpus: usize) -> System {
-        let mut processors = Vec::with_capacity(num_cpus);
-        for index in 0..num_cpus {
-            processors.push(Processor::new(index));
-        }
+        let processors: Vec<Processor> = (0..num_cpus).map(Processor::new).collect();
 
-        // just to make sure that processor index is consistent
+        // just to make sure that processor index is valid
         for (i, p) in processors.iter().enumerate() {
             assert_eq!(i, p.index);
         }
 
+        let steal_hint: Vec<(CachePadded<AtomicUsize>, Vec<usize>)> = (3..)
+            .step_by(2)
+            .filter(|i| coprime(*i, num_cpus))
+            .take(num_cpus)
+            .enumerate()
+            .map(|(i, c)| {
+                (0..num_cpus)
+                    .map(move |j| ((c * j) + i) % num_cpus)
+                    .filter(move |s| *s != i)
+                    .collect()
+            })
+            .map(|o| (CachePadded::default(), o))
+            .collect();
+
+        // just to make sure that steal_hint are valid
+        let sum: usize = (0..num_cpus).sum();
+        for (i, s) in steal_hint.iter().enumerate() {
+            assert!(s.1.iter().all(|&x| x != i));
+            assert_eq!(sum, i + s.1.iter().sum::<usize>());
+        }
+
         System {
             processors,
-            injector: Injector::new(),
-            steal_index_hint: AtomicUsize::new(0),
+            steal_hint,
+
             tick: AtomicU64::new(0),
+            push_hint: AtomicUsize::new(0),
             sleeper: Sleeper::new(),
         }
     }
 
+    #[inline(always)]
     fn sysmon_run(&'static self) {
         #[cfg(feature = "tracing")]
         trace!("Sysmon is running");
@@ -91,77 +110,56 @@ impl System {
         }
     }
 
+    #[inline(always)]
     pub fn sysmon_wake_up(&self) {
         self.sleeper.wake_up();
     }
 
+    #[inline(always)]
     pub fn push(&self, task: Task) {
-        if let Err(task) = machine::direct_push(task) {
-            #[cfg(feature = "tracing")]
-            trace!("{:?} is pushed to global queue", task.tag());
-
-            self.injector.push(task);
-            self.processors_wake_up();
-        }
-    }
-
-    pub fn processors_wake_up(&self) {
-        // wake up processor that unlikely to be stolen near future
-        let mut index = self.recalc_steal_index_hint(0) + self.processors.len() - 1;
-        if index >= self.processors.len() {
-            index -= self.processors.len();
-        }
-
-        let p = &self.processors[index];
-        let already_running = !p.is_sleeping();
-
-        p.wake_up();
-
-        // wake up another one, in case p need help
-        if already_running {
-            let (l, r) = self.processors.split_at(index);
-            r.iter().chain(l.iter()).rev().find(|p| p.wake_up());
-        }
-    }
-
-    pub fn pop(&self, worker: &Worker<Task>) -> Option<Task> {
-        // repeat until success or empty
-        std::iter::repeat_with(|| self.injector.steal_batch_and_pop(worker))
-            .find(|s| !s.is_retry())
-            .map(|s| match s {
-                Steal::Success(task) => Some(task),
-                Steal::Empty => None,
-                Steal::Retry => unreachable!(), // already filtered
-            })
-            .flatten()
+        match machine::direct_push(task) {
+            Ok(mut index) => {
+                if index == self.processors.len() - 1 {
+                    index = 0;
+                } else {
+                    index += 1;
+                }
+                self.processors[index].wake_up();
+            }
+            Err(task) => {
+                let mut index = task.tag().get_index_hint();
+                if index >= self.processors.len() {
+                    index = atomic_usize_add_mod(&self.push_hint, 1, self.processors.len());
+                }
+                let p = &self.processors[index];
+                p.push(task);
+                p.wake_up();
+            }
+        };
     }
 
     #[inline(always)]
-    fn recalc_steal_index_hint(&self, add: usize) -> usize {
-        let old_hint = self.steal_index_hint.fetch_add(add, Ordering::Relaxed);
-        if old_hint < self.processors.len() {
-            return old_hint;
+    pub fn pop(&self, worker: &Worker<Task>, index: usize) -> Option<Task> {
+        let (l, r) = self.processors.split_at(index);
+        for p in r.iter().chain(l.iter()) {
+            if let Some(task) = p.pop(worker) {
+                return Some(task);
+            }
         }
-
-        let hint = old_hint % self.processors.len();
-        self.steal_index_hint
-            .compare_and_swap(old_hint + add, hint + add, Ordering::Relaxed);
-
-        hint
+        None
     }
 
-    pub fn steal(&self, worker: &Worker<Task>) -> Option<Task> {
-        let (l, r) = self.processors.split_at(self.recalc_steal_index_hint(1));
-        (r.iter().chain(l.iter()).enumerate())
-            .map(|(i, p)| (i, p.steal(worker)))
-            .find(|(_, s)| s.is_some())
-            .map(|(i, s)| {
-                if i != 0 {
-                    self.recalc_steal_index_hint(i);
-                }
-                s
-            })
-            .flatten()
+    #[inline(always)]
+    pub fn steal(&self, worker: &Worker<Task>, index: usize) -> Option<Task> {
+        let (steal_index, steal_order) = &self.steal_hint[index];
+        let (l, r) = steal_order.split_at(atomic_usize_add_mod(steal_index, 1, steal_order.len()));
+        for (add, &index) in r.iter().chain(l.iter()).enumerate() {
+            if let Some(task) = self.processors[index].steal(worker) {
+                atomic_usize_add_mod(steal_index, add, steal_order.len());
+                return Some(task);
+            }
+        }
+        None
     }
 
     #[inline(always)]
@@ -170,6 +168,7 @@ impl System {
     }
 }
 
+#[inline(always)]
 pub fn get() -> &'static System {
     static SYSTEM: Lazy<System> = Lazy::new(|| {
         thread::spawn(move || abort_on_panic(move || get().sysmon_run()));

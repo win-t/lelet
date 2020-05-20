@@ -1,4 +1,3 @@
-#[cfg(feature = "tracing")]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(feature = "tracing")]
@@ -7,6 +6,8 @@ use log::trace;
 pub struct TaskTag {
     #[cfg(feature = "tracing")]
     id: usize,
+
+    index_hint: AtomicUsize,
 }
 
 impl TaskTag {
@@ -18,6 +19,8 @@ impl TaskTag {
         let tag = TaskTag {
             #[cfg(feature = "tracing")]
             id: TASK_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+
+            index_hint: AtomicUsize::new(usize::MAX),
         };
 
         #[cfg(feature = "tracing")]
@@ -25,11 +28,21 @@ impl TaskTag {
 
         tag
     }
+
+    #[inline(always)]
+    pub fn get_index_hint(&self) -> usize {
+        self.index_hint.load(Ordering::Relaxed)
+    }
+
+    #[inline(always)]
+    pub fn set_index_hint(&self, index: usize) {
+        self.index_hint.store(index, Ordering::Relaxed);
+    }
 }
 
 #[cfg(feature = "tracing")]
 impl std::fmt::Debug for TaskTag {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.write_str(&format!("Task({})", self.id))
     }
 }

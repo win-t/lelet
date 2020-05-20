@@ -1,8 +1,7 @@
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
-use std::thread;
 
-use crossbeam_deque::{Steal, Stealer, Worker};
+use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use crossbeam_utils::Backoff;
 
 #[cfg(feature = "tracing")]
@@ -30,6 +29,7 @@ pub struct Processor {
 
     current_task: AtomicPtr<TaskTag>,
 
+    injector: Injector<Task>,
     queue: Queue,
 
     sleeper: Sleeper,
@@ -44,6 +44,7 @@ impl Processor {
             sleeping: AtomicBool::new(false),
             current_machine: AtomicPtr::new(ptr::null_mut()),
             current_task: AtomicPtr::new(ptr::null_mut()),
+            injector: Injector::new(),
             queue: Queue::new(),
             sleeper: Sleeper::new(),
         };
@@ -54,12 +55,13 @@ impl Processor {
         processor
     }
 
+    #[inline(always)]
     pub fn run_on(&self, machine: &Machine) {
         // steal this processor from current machine
         self.current_machine
             .store(machine as *const _ as *mut _, Ordering::Relaxed);
 
-        let mut worker = match self.check_machine_and_acquire_worker(machine) {
+        let mut worker = match self.acquire_worker(machine) {
             Some(worker) => worker,
             None => return,
         };
@@ -91,7 +93,9 @@ impl Processor {
                     self.last_seen
                         .store(machine.system.now(), Ordering::Relaxed);
 
-                    worker = match self.unlock_worker_and_then(machine, worker, || {
+                    $task.tag().set_index_hint(self.index);
+
+                    worker = match self.unlock_worker(machine, worker, || {
                         $task.run();
                     }) {
                         Some(worker) => worker,
@@ -127,7 +131,7 @@ impl Processor {
             macro_rules! run_global_task {
                 () => {
                     run_counter = 0;
-                    if let Some(task) = machine.system.pop(worker.get_ref()) {
+                    if let Some(task) = machine.system.pop(worker.get_ref(), self.index) {
                         run_task!(task);
                     }
                 };
@@ -135,7 +139,7 @@ impl Processor {
 
             macro_rules! run_stolen_task {
                 () => {
-                    if let Some(task) = machine.system.steal(worker.get_ref()) {
+                    if let Some(task) = machine.system.steal(worker.get_ref(), self.index) {
                         run_task!(task);
                     }
                 };
@@ -156,7 +160,7 @@ impl Processor {
             run_stolen_task!();
 
             // 3.a. no more task for now, just sleep
-            worker = match self.unlock_worker_and_then(machine, worker, || {
+            worker = match self.unlock_worker(machine, worker, || {
                 self.sleep(machine, &backoff);
             }) {
                 Some(worker) => worker,
@@ -173,17 +177,15 @@ impl Processor {
 
     /// will fail if machine no longer hold the processor (stolen)
     #[inline(always)]
-    fn check_machine_and_acquire_worker(
-        &self,
-        machine: &Machine,
-    ) -> Option<SimpleLockGuard<'_, WorkerWrapper>> {
+    fn acquire_worker(&self, machine: &Machine) -> Option<WorkerLock> {
+        let backoff = Backoff::new();
         loop {
             // fast check, without lock
             if !ptr::eq(self.current_machine.load(Ordering::Relaxed), machine) {
                 return None;
             }
 
-            if let Some(lock) = self.queue.worker.try_lock() {
+            if let Some(lock) = self.queue.try_lock_worker() {
                 // check again after locking
                 if !ptr::eq(self.current_machine.load(Ordering::Relaxed), machine) {
                     drop(lock);
@@ -193,23 +195,16 @@ impl Processor {
                 return Some(lock);
             }
 
-            thread::yield_now();
+            backoff.snooze();
         }
     }
 
     /// unlock the worker lock, run f, and then reacquire worker lock again,
     #[inline(always)]
-    fn unlock_worker_and_then(
-        &self,
-        machine: &Machine,
-        lock: SimpleLockGuard<'_, WorkerWrapper>,
-        f: impl FnOnce(),
-    ) -> Option<SimpleLockGuard<'_, WorkerWrapper>> {
-        drop(lock);
-
+    fn unlock_worker(&self, m: &Machine, w: WorkerLock, f: impl FnOnce()) -> Option<WorkerLock> {
+        drop(w);
         f();
-
-        self.check_machine_and_acquire_worker(machine)
+        self.acquire_worker(m)
     }
 
     #[inline(always)]
@@ -222,6 +217,7 @@ impl Processor {
         self.sleeping.load(Ordering::Relaxed)
     }
 
+    #[inline(always)]
     fn sleep(&self, machine: &Machine, backoff: &Backoff) {
         if backoff.is_completed() {
             self.sleeping.store(true, Ordering::Relaxed);
@@ -237,14 +233,16 @@ impl Processor {
         }
     }
 
-    pub fn wake_up(&self) -> bool {
-        self.sleeper.wake_up()
+    #[inline(always)]
+    pub fn wake_up(&self) {
+        self.sleeper.wake_up();
     }
 
-    pub fn check_machine_and_push(&self, machine: &Machine, task: Task) -> Result<(), Task> {
-        match self.check_machine_and_acquire_worker(machine) {
+    #[inline(always)]
+    pub fn direct_push(&self, machine: &Machine, task: Task) -> Result<(), Task> {
+        match self.acquire_worker(machine) {
             Some(mut worker) => {
-                // if current task is rescheduled when running, do not prioritize it
+                // if current task is pushed while running, do not prioritize it
                 let prioritized = !ptr::eq(
                     self.current_task.load(Ordering::Relaxed),
                     task.tag() as *const _ as *mut _,
@@ -254,13 +252,13 @@ impl Processor {
                 {
                     if prioritized {
                         trace!(
-                            "{:?} directly pushed to {:?}'s local queue (prioritized)",
+                            "{:?} is directly pushed to {:?}'s local queue (prioritized)",
                             task.tag(),
                             self
                         );
                     } else {
                         trace!(
-                            "{:?} directly pushed to {:?}'s local queue",
+                            "{:?} is directly pushed to {:?}'s local queue",
                             task.tag(),
                             self
                         );
@@ -268,7 +266,6 @@ impl Processor {
                 }
 
                 worker.push(prioritized, task);
-                machine.system.processors_wake_up();
 
                 Ok(())
             }
@@ -276,21 +273,42 @@ impl Processor {
         }
     }
 
+    #[inline(always)]
     pub fn steal(&self, worker: &Worker<Task>) -> Option<Task> {
-        std::iter::repeat_with(|| self.queue.stealer.steal_batch_and_pop(worker))
-            .find(|s| !s.is_retry())
-            .map(|s| match s {
-                Steal::Success(task) => Some(task),
-                Steal::Empty => None,
-                Steal::Retry => unreachable!(), // already filtered
-            })
-            .flatten()
+        let backoff = Backoff::new();
+        loop {
+            match self.queue.stealer.steal_batch_and_pop(worker) {
+                Steal::Success(task) => return Some(task),
+                Steal::Empty => return None,
+                Steal::Retry => backoff.spin(),
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub fn push(&self, task: Task) {
+        #[cfg(feature = "tracing")]
+        trace!("{:?} is pushed to {:?}'s global queue", task.tag(), self);
+
+        self.injector.push(task);
+    }
+
+    #[inline(always)]
+    pub fn pop(&self, worker: &Worker<Task>) -> Option<Task> {
+        let backoff = Backoff::new();
+        loop {
+            match self.injector.steal_batch_and_pop(worker) {
+                Steal::Success(task) => return Some(task),
+                Steal::Empty => return None,
+                Steal::Retry => backoff.spin(),
+            }
+        }
     }
 }
 
 #[cfg(feature = "tracing")]
 impl std::fmt::Debug for Processor {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.write_str(&format!("Processor({})", self.index))
     }
 }
@@ -308,10 +326,12 @@ impl WorkerWrapper {
         }
     }
 
+    #[inline(always)]
     fn pop(&mut self) -> Option<Task> {
         self.prioritized.take().or_else(|| self.wrapped.pop())
     }
 
+    #[inline(always)]
     fn push(&mut self, prioritized: bool, task: Task) {
         if prioritized {
             if let Some(task) = self.prioritized.replace(task) {
@@ -322,6 +342,7 @@ impl WorkerWrapper {
         }
     }
 
+    #[inline(always)]
     fn get_ref(&mut self) -> &Worker<Task> {
         &self.wrapped
     }
@@ -332,6 +353,8 @@ struct Queue {
     stealer: Stealer<Task>,
 }
 
+type WorkerLock<'a> = SimpleLockGuard<'a, WorkerWrapper>;
+
 impl Queue {
     fn new() -> Queue {
         let worker = Worker::new_fifo();
@@ -340,5 +363,10 @@ impl Queue {
             worker: SimpleLock::new(WorkerWrapper::new(worker)),
             stealer,
         }
+    }
+
+    #[inline(always)]
+    fn try_lock_worker(&self) -> Option<WorkerLock> {
+        self.worker.try_lock()
     }
 }

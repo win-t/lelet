@@ -8,6 +8,7 @@
 //    acquire/release from global list
 // 2. machine don't live without a processor (when stolen by others),
 //    it must exit as soon as possible
+// 3. each processor have dedicated global queue
 
 mod machine;
 mod processor;
@@ -51,7 +52,8 @@ pub struct JoinHandle<R>(async_task::JoinHandle<R, TaskTag>);
 impl<R> Future for JoinHandle<R> {
     type Output = R;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    #[inline(always)]
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         match Pin::new(&mut self.0).poll(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Some(val)) => Poll::Ready(val),

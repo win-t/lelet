@@ -23,7 +23,7 @@ pub struct ThreadID(Cell<usize>);
 
 #[cfg(feature = "tracing")]
 impl std::fmt::Debug for ThreadID {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.write_str(&format!("Thread({})", self.0.get()))
     }
 }
@@ -53,6 +53,7 @@ impl Pool {
         }
     }
 
+    #[inline(always)]
     fn put_job(&'static self, job: Job) {
         self.sender.try_send(job).unwrap_or_else(|err| match err {
             TrySendError::Full(job) => {
@@ -65,6 +66,7 @@ impl Pool {
         });
     }
 
+    #[inline(always)]
     fn run(&self) {
         #[cfg(feature = "tracing")]
         THREAD_ID.with(|id| {

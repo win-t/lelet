@@ -53,6 +53,7 @@ impl Machine {
         Rc::new(machine)
     }
 
+    #[inline(always)]
     fn run(self: &Rc<Machine>) {
         CURRENT.with(|current| current.borrow_mut().replace(self.clone()));
         defer! { CURRENT.with(|current| { current.borrow_mut().take() }); }
@@ -63,7 +64,7 @@ impl Machine {
 
 #[cfg(feature = "tracing")]
 impl std::fmt::Debug for Machine {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.write_str(&format!("Machine({})", self.id))
     }
 }
@@ -83,15 +84,20 @@ pub fn spawn(system: &'static System, processor: &'static Processor) {
     }));
 }
 
-pub fn direct_push(task: Task) -> Result<(), Task> {
+#[inline(always)]
+pub fn direct_push(task: Task) -> Result<usize, Task> {
     CURRENT.with(|current| {
         let mut current = current.borrow_mut();
         match current.as_ref() {
             None => Err(task),
-            Some(m) => m.processor.check_machine_and_push(m, task).map_err(|err| {
-                current.take();
-                err
-            }),
+            Some(m) => m
+                .processor
+                .direct_push(m, task)
+                .map(|()| m.processor.index)
+                .map_err(|err| {
+                    current.take();
+                    err
+                }),
         }
     })
 }
