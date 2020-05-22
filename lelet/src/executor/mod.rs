@@ -15,7 +15,8 @@ mod processor;
 mod system;
 mod task;
 
-pub use machine::mark_blocking;
+pub use system::mark_blocking;
+
 pub use system::get_num_cpus;
 pub use system::set_num_cpus;
 

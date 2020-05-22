@@ -178,6 +178,14 @@ pub fn get() -> &'static System {
     &SYSTEM
 }
 
+/// spawn new machine for current processor.
+///
+/// this is useful if you know that you are going to do blocking that longer
+/// than blocking threshold.
+pub fn mark_blocking() {
+    machine::respawn();
+}
+
 static NUM_CPUS: AtomicUsize = AtomicUsize::new(0);
 
 /// set the number of executor thread

@@ -102,11 +102,7 @@ pub fn direct_push(task: Task) -> Result<usize, Task> {
     })
 }
 
-/// spawn new machine for current processor.
-///
-/// this is useful if you know that you are going to do blocking that longer
-/// than blocking threshold.
-pub fn mark_blocking() {
+pub fn respawn() {
     CURRENT.with(|current| {
         if let Some(m) = current.borrow_mut().take() {
             #[cfg(feature = "tracing")]
