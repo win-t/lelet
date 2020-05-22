@@ -91,21 +91,20 @@ impl System {
         loop {
             if self.processors.iter().all(|p| p.is_sleeping()) {
                 self.parker.park();
-            } else {
-                let check_tick = self.tick.fetch_add(1, Ordering::Relaxed) + 1;
+            }
 
-                thread::sleep(BLOCKING_THRESHOLD);
+            let check_tick = self.tick.fetch_add(1, Ordering::Relaxed) + 1;
 
-                if !self.processors.iter().any(|p| p.is_sleeping()) {
-                    self.processors
-                        .iter()
-                        .filter(|p| p.get_last_seen() < check_tick)
-                        .for_each(|p| {
-                            #[cfg(feature = "tracing")]
-                            trace!("{:?} is blocked, spawn new machine for it", p);
+            thread::sleep(BLOCKING_THRESHOLD);
 
-                            machine::spawn(self, p.index);
-                        });
+            if !self.processors.iter().any(|p| p.is_sleeping()) {
+                for p in &self.processors {
+                    if p.get_last_seen() < check_tick {
+                        #[cfg(feature = "tracing")]
+                        trace!("{:?} is blocked, spawn new machine for it", p);
+
+                        machine::spawn(self, p.index);
+                    }
                 }
             }
         }
@@ -117,27 +116,35 @@ impl System {
     }
 
     #[inline(always)]
+    fn next_push_index(&self) -> usize {
+        atomic_usize_add_mod(&self.push_hint, 1, self.processors.len())
+    }
+
+    #[inline(always)]
     pub fn push(&self, task: Task) {
-        match machine::direct_push(task) {
-            Ok(mut index) => {
-                index += 1;
-                if index == self.processors.len() {
-                    index = 0;
+        let index = match machine::direct_push(task) {
+            Ok(current_index) => {
+                if self.processors.len() == 1 {
+                    current_index
+                } else {
+                    let mut index = self.next_push_index();
+                    if current_index == index {
+                        index = self.next_push_index();
+                    }
+                    index
                 }
-                self.processors[index].wake_up();
             }
             Err(task) => {
                 let mut index = task.tag().get_index_hint();
                 if index >= self.processors.len() {
-                    index = atomic_usize_add_mod(&self.push_hint, 1, self.processors.len());
+                    index = self.next_push_index();
                 }
-
-                let p = &self.processors[index];
-
-                p.push_global(task);
-                p.wake_up();
+                self.processors[index].push_global(task);
+                index
             }
         };
+
+        self.processors[index].wake_up();
     }
 
     #[inline(always)]
@@ -235,12 +242,10 @@ pub fn atomic_usize_add_mod(p: &AtomicUsize, i: usize, m: usize) -> usize {
     }
 }
 
-#[inline(always)]
 pub fn coprime(a: usize, b: usize) -> bool {
     gcd(a, b) == 1
 }
 
-#[inline(always)]
 pub fn gcd(a: usize, b: usize) -> usize {
     let mut p = (a, b);
     while p.1 != 0 {
