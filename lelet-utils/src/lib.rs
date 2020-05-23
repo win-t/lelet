@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-/// call [`abort`] when `f` panic
+/// Call [`abort`] when `f` panic
 ///
 /// [`abort`]: https://doc.rust-lang.org/std/process/fn.abort.html
 pub fn abort_on_panic(f: impl FnOnce()) {
@@ -29,7 +29,7 @@ pub fn abort_on_panic(f: impl FnOnce()) {
     forget(bomb);
 }
 
-/// defer the execution until the scope is done
+/// Defer the execution until the scope is done
 #[macro_export]
 macro_rules! defer {
   ($($body:tt)*) => {
@@ -49,6 +49,9 @@ macro_rules! defer {
   };
 }
 
+/// Extracts the successful type of a `Poll<T>`.
+///
+/// This macro bakes in propagation of `Pending` signals by returning early.
 #[macro_export]
 macro_rules! ready {
     ($e:expr $(,)?) => {
@@ -167,7 +170,7 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for SimpleLockGuard<'_, T> {
     }
 }
 
-/// block current thread until f is complete
+/// Block current thread until f is complete
 pub fn block_on<F: Future>(mut f: F) -> F::Output {
     // originally copied from `extreme` (https://docs.rs/extreme)
 
