@@ -47,7 +47,11 @@ where
     JoinHandle(handle)
 }
 
-/// JoinHandle that you can `await` for
+/// Handle that you can `await` for
+///
+/// this struct returned by [`spawn`]
+///
+/// [`spawn`]: fn.spawn.html
 pub struct JoinHandle<R>(async_task::JoinHandle<R, TaskTag>);
 
 impl<R> Future for JoinHandle<R> {

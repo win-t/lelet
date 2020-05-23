@@ -207,9 +207,9 @@ pub fn detach_current_thread() {
 
 static NUM_CPUS: AtomicUsize = AtomicUsize::new(0);
 
-/// set the number of executor thread
+/// Set the number of executor thread
 ///
-/// analogous to GOMAXPROCS in golang,
+/// Analogous to `GOMAXPROCS` in golang,
 /// can only be set once and before executor is running,
 /// if not set before executor running, it will be the number of available cpu in the host
 #[inline(always)]
@@ -222,11 +222,17 @@ pub fn set_num_cpus(size: usize) -> Result<(), String> {
     }
 }
 
-/// get the number of executor thread,
-/// 0 if executor is not run yet
+/// Get the number of executor thread
+///
+/// `None` if the executor thread is not run yet
 #[inline(always)]
-pub fn get_num_cpus() -> usize {
-    NUM_CPUS.load(Ordering::Relaxed)
+pub fn get_num_cpus() -> Option<usize> {
+    let n = NUM_CPUS.load(Ordering::Relaxed);
+    if n == 0 {
+        None
+    } else {
+        Some(n)
+    }
 }
 
 #[inline(always)]

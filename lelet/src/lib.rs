@@ -19,10 +19,10 @@ mod executor;
 pub use executor::spawn;
 pub use executor::JoinHandle;
 
-#[doc(hidden)]
 pub use executor::get_num_cpus;
-#[doc(hidden)]
 pub use executor::set_num_cpus;
+
+pub use lelet_utils::block_on;
 
 #[doc(hidden)]
 pub use executor::detach_current_thread;
