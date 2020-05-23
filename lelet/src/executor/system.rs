@@ -93,10 +93,11 @@ impl System {
             .iter()
             .for_each(|p| machine::spawn(self, p.index));
 
-        let parker = self.parker.try_lock().unwrap();
         loop {
             if self.processors.iter().all(|p| p.is_sleeping()) {
-                parker.park();
+                if let Some(parker) = self.parker.try_lock() {
+                    parker.park();
+                }
             }
 
             let check_tick = self.tick.fetch_add(1, Ordering::Relaxed) + 1;
