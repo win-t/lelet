@@ -44,11 +44,6 @@ impl System {
     fn new(num_cpus: usize) -> System {
         let processors: Vec<Processor> = (0..num_cpus).map(Processor::new).collect();
 
-        // just to make sure that processor index is valid
-        for (i, p) in processors.iter().enumerate() {
-            assert_eq!(i, p.index);
-        }
-
         let steal_orders: Vec<Vec<usize>> = (3..)
             .step_by(2)
             .filter(|&i| coprime(i, num_cpus))
@@ -62,14 +57,21 @@ impl System {
             })
             .collect();
 
-        // just to make sure that steal_orders are valid
-        let checksum: usize = (0..num_cpus).sum();
-        for (i, s) in steal_orders.iter().enumerate() {
-            assert_eq!(checksum, i + s.iter().sum::<usize>());
-        }
-
         let parker = Parker::new();
         let unparker = parker.unparker().clone();
+
+        // do some validity check
+        // this will justify the usage of unsafe get_unchecked
+        assert_eq!(processors.len(), steal_orders.len());
+        for (i, p) in processors.iter().enumerate() {
+            assert_eq!(i, p.index);
+        }
+        for (i, s) in steal_orders.iter().enumerate() {
+            assert!((0..num_cpus).eq(std::iter::once(i)
+                .chain(s.clone().into_iter())
+                .collect::<std::collections::BinaryHeap<usize>>()
+                .into_sorted_vec()));
+        }
 
         System {
             processors,
@@ -95,26 +97,35 @@ impl System {
 
         loop {
             if self.processors.iter().all(|p| p.is_sleeping()) {
+                #[cfg(feature = "tracing")]
+                trace!("Sysmon entering sleep");
                 if let Some(parker) = self.parker.try_lock() {
                     parker.park();
                 }
+                #[cfg(feature = "tracing")]
+                trace!("Sysmon exiting sleep");
             }
 
             let check_tick = self.tick.fetch_add(1, Ordering::Relaxed) + 1;
 
             thread::sleep(BLOCKING_THRESHOLD);
 
-            let mut sleeping_processors = self.processors.iter().filter(|p| p.is_sleeping());
+            if self.processors.iter().any(|p| !p.is_empty()) {
+                let mut sleeping_processors = self.processors.iter().filter(|p| p.is_sleeping());
 
-            for p in &self.processors {
-                if p.get_last_seen() < check_tick {
-                    if let Some(p) = sleeping_processors.next() {
-                        p.wake_up();
-                    } else {
-                        #[cfg(feature = "tracing")]
-                        trace!("{:?} is blocked, spawn new machine for it", p);
+                for p in &self.processors {
+                    if p.get_last_seen() < check_tick {
+                        if let Some(other) = sleeping_processors.next() {
+                            #[cfg(feature = "tracing")]
+                            trace!("{:?} is blocked, waking up {:?}", p, other);
 
-                        machine::spawn(self, p.index);
+                            other.wake_up();
+                        } else {
+                            #[cfg(feature = "tracing")]
+                            trace!("{:?} is blocked, spawn new machine for it", p);
+
+                            machine::spawn(self, p.index);
+                        }
                     }
                 }
             }
@@ -122,28 +133,47 @@ impl System {
     }
 
     #[inline(always)]
+    fn next_push_index(&self) -> usize {
+        // will always in range 0..processors.len()
+        // this will justify the usage of unsafe get_unchecked
+        loop {
+            let index = self.push_hint.load(Ordering::Relaxed);
+            if self.push_hint.compare_and_swap(
+                index,
+                (index + 1) % self.processors.len(),
+                Ordering::Relaxed,
+            ) == index
+            {
+                break index;
+            }
+        }
+    }
+
+    #[inline(always)]
     pub fn push(&self, task: Task) {
-        if let Err(task) = machine::direct_push(task) {
-            let mut index = task.tag().get_index_hint();
-            if index >= self.processors.len() {
-                loop {
-                    index = self.push_hint.load(Ordering::Relaxed);
-                    if self.push_hint.compare_and_swap(
-                        index,
-                        (index + 1) % self.processors.len(),
-                        Ordering::Relaxed,
-                    ) == index
-                    {
-                        break;
+        match machine::direct_push(task) {
+            Ok((index, counter)) => {
+                // wakeup others in case processors[index] need help
+                if counter > 1 {
+                    let mut other_index = self.next_push_index();
+                    if index == other_index {
+                        other_index = self.next_push_index();
                     }
+                    unsafe { self.processors.get_unchecked(other_index) }.wake_up();
                 }
             }
+            Err(task) => {
+                let mut index = task.tag().get_index_hint();
+                if index >= self.processors.len() {
+                    index = self.next_push_index();
+                }
 
-            self.unparker.unpark();
+                self.unparker.unpark();
 
-            let p = &self.processors[index];
-            p.push_global(task);
-            p.wake_up();
+                let p = unsafe { &self.processors.get_unchecked(index) };
+                p.push_global(task);
+                p.wake_up();
+            }
         }
     }
 
@@ -152,8 +182,8 @@ impl System {
         let mut retry = true;
         while retry {
             retry = false;
-            for &index in
-                std::iter::once(&processor.index).chain(self.steal_orders[processor.index].iter())
+            for &index in std::iter::once(&processor.index)
+                .chain(unsafe { self.steal_orders.get_unchecked(processor.index) }.iter())
             {
                 match unsafe { self.processors.get_unchecked(index) }.pop_global(worker) {
                     Steal::Success(task) => return Some(task),
@@ -170,7 +200,7 @@ impl System {
         let mut retry = true;
         while retry {
             retry = false;
-            for &index in &self.steal_orders[processor.index] {
+            for &index in unsafe { self.steal_orders.get_unchecked(processor.index) } {
                 match unsafe { self.processors.get_unchecked(index) }.steal_local(worker) {
                     Steal::Success(task) => return Some(task),
                     Steal::Empty => {}

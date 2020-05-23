@@ -89,9 +89,7 @@ impl Processor {
         self.sleeping.store(false, Ordering::Relaxed);
 
         #[cfg(feature = "tracing")]
-        crate::thread_pool::THREAD_ID.with(|tid| {
-            trace!("{:?} is now running on {:?} on {:?}", self, machine, tid);
-        });
+        trace!("{:?} is now running on {:?} ", self, machine);
 
         loop {
             qlock.flush_slot();
@@ -124,6 +122,8 @@ impl Processor {
                 }
 
                 // 3. no more task for now, just sleep
+                #[cfg(feature = "tracing")]
+                trace!("{:?} entering sleep", self);
                 self.sleeping.store(true, Ordering::Relaxed);
                 qlock = check!(self.without_qlock(machine, qlock, || {
                     if let Some(parker) = self.parker.try_lock() {
@@ -131,6 +131,8 @@ impl Processor {
                     }
                 }));
                 self.sleeping.store(false, Ordering::Relaxed);
+                #[cfg(feature = "tracing")]
+                trace!("{:?} exiting sleep", self);
             }
         }
     }
@@ -146,7 +148,7 @@ impl Processor {
         let task_info = format!("{:?}", task.tag());
 
         #[cfg(feature = "tracing")]
-        trace!("{} is running on {:?}", task_info, self);
+        trace!("{} is running on {:?} on {:?}", task_info, self, machine);
 
         self.last_seen
             .store(machine.system.now(), Ordering::Relaxed);
@@ -169,7 +171,12 @@ impl Processor {
         self.last_seen.store(u64::MAX, Ordering::Relaxed);
 
         #[cfg(feature = "tracing")]
-        trace!("{} is done running on {:?}", task_info, self);
+        trace!(
+            "{} is done running on {:?} on {:?}",
+            task_info,
+            self,
+            machine
+        );
 
         Some(qlock)
     }
@@ -226,20 +233,14 @@ impl Processor {
     }
 
     #[inline(always)]
-    pub fn push_local(&self, machine: &Machine, task: Task) -> Result<(), Task> {
+    pub fn push_local(&self, machine: &Machine, task: Task) -> Result<usize, Task> {
         match self.try_acquire_qlock(machine) {
             None => Err(task),
-            Some(qlock) => {
+            Some(mut qlock) => {
                 #[cfg(feature = "tracing")]
-                trace!(
-                    "{:?} is directly pushed to {:?}'s local queue",
-                    task.tag(),
-                    self
-                );
+                trace!("{:?} is pushed to {:?}'s local queue", task.tag(), self);
 
-                qlock.push(task);
-
-                Ok(())
+                Ok(qlock.push(task))
             }
         }
     }
@@ -265,6 +266,11 @@ impl Processor {
     pub fn pop_global(&self, worker: &Worker<Task>) -> Steal<Task> {
         self.global.steal_batch_and_pop(worker)
     }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.global.is_empty() && self.stealers[0].is_empty() && self.stealers[1].is_empty()
+    }
 }
 
 #[cfg(feature = "tracing")]
@@ -275,6 +281,7 @@ impl std::fmt::Debug for Processor {
 }
 
 struct Queue {
+    counter: usize,
     slot: Worker<Task>,
     worker: Worker<Task>,
 }
@@ -282,28 +289,41 @@ struct Queue {
 impl Queue {
     fn new() -> Queue {
         Queue {
+            counter: 0,
             slot: Worker::new_lifo(),
             worker: Worker::new_fifo(),
         }
     }
 
     #[inline(always)]
-    fn flush_slot(&self) {
+    fn flush_slot(&mut self) {
         let slot_stealer = self.slot.stealer();
         loop {
             if let Steal::Empty = slot_stealer.steal_batch(&self.worker) {
                 break;
             }
         }
+        self.counter = 0;
     }
 
     #[inline(always)]
-    fn pop(&self) -> Option<Task> {
-        self.slot.pop().or_else(|| self.worker.pop())
+    fn pop(&mut self) -> Option<Task> {
+        self.slot
+            .pop()
+            .map(|t| {
+                self.counter -= 1;
+                t
+            })
+            .or_else(|| {
+                self.counter = 0;
+                self.worker.pop()
+            })
     }
 
     #[inline(always)]
-    fn push(&self, task: Task) {
+    fn push(&mut self, task: Task) -> usize {
+        self.counter += 1;
         self.slot.push(task);
+        self.counter
     }
 }
