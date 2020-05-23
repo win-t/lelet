@@ -66,7 +66,7 @@ pub struct Yields(pub usize);
 impl Future for Yields {
     type Output = ();
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<()> {
         if self.0 == 0 {
             Poll::Ready(())
         } else {
@@ -110,7 +110,7 @@ impl<T: ?Sized + Default> Default for SimpleLock<T> {
 impl<T: ?Sized> SimpleLock<T> {
     /// Try to lock.
     #[inline(always)]
-    pub fn try_lock(&self) -> Option<SimpleLockGuard<'_, T>> {
+    pub fn try_lock(&self) -> Option<SimpleLockGuard<T>> {
         if self.locked.swap(true, Ordering::Acquire) {
             None
         } else {
@@ -123,7 +123,7 @@ impl<T: ?Sized> SimpleLock<T> {
 }
 
 impl<T: ?Sized + fmt::Debug> fmt::Debug for SimpleLock<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.try_lock() {
             Some(guard) => f.debug_tuple("SimpleLock").field(&&*guard).finish(),
             None => f.write_str("SimpleLock(<locked>)"),
@@ -162,7 +162,7 @@ impl<T: ?Sized> DerefMut for SimpleLockGuard<'_, T> {
 }
 
 impl<T: ?Sized + fmt::Debug> fmt::Debug for SimpleLockGuard<'_, T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         fmt::Debug::fmt(&**self, f)
     }
 }

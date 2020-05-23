@@ -75,7 +75,7 @@ impl System {
             processors,
             steal_orders,
 
-            tick: AtomicU64::new(10),
+            tick: AtomicU64::new(0),
             push_hint: AtomicUsize::new(0),
 
             parker: SimpleLock::new(parker),
@@ -93,9 +93,10 @@ impl System {
             .iter()
             .for_each(|p| machine::spawn(self, p.index));
 
+        let parker = self.parker.try_lock().unwrap();
         loop {
             if self.processors.iter().all(|p| p.is_sleeping()) {
-                self.parker.try_lock().unwrap().park();
+                parker.park();
             }
 
             let check_tick = self.tick.fetch_add(1, Ordering::Relaxed) + 1;
@@ -121,31 +122,28 @@ impl System {
 
     #[inline(always)]
     pub fn push(&self, task: Task) {
-        match machine::direct_push(task) {
-            Ok(()) => {}
-            Err(task) => {
-                let mut index = task.tag().get_index_hint();
-                if index >= self.processors.len() {
-                    loop {
-                        index = self.push_hint.load(Ordering::Relaxed);
-                        if self.push_hint.compare_and_swap(
-                            index,
-                            (index + 1) % self.processors.len(),
-                            Ordering::Relaxed,
-                        ) == index
-                        {
-                            break;
-                        }
+        if let Err(task) = machine::direct_push(task) {
+            let mut index = task.tag().get_index_hint();
+            if index >= self.processors.len() {
+                loop {
+                    index = self.push_hint.load(Ordering::Relaxed);
+                    if self.push_hint.compare_and_swap(
+                        index,
+                        (index + 1) % self.processors.len(),
+                        Ordering::Relaxed,
+                    ) == index
+                    {
+                        break;
                     }
                 }
-
-                self.unparker.unpark();
-
-                let p = &self.processors[index];
-                p.push_global(task);
-                p.wake_up();
             }
-        };
+
+            self.unparker.unpark();
+
+            let p = &self.processors[index];
+            p.push_global(task);
+            p.wake_up();
+        }
     }
 
     #[inline(always)]
@@ -202,6 +200,7 @@ pub fn get() -> &'static System {
 ///
 /// this is useful if you know that you are going to do blocking that longer
 /// than blocking threshold.
+#[inline(always)]
 pub fn detach_current_thread() {
     machine::respawn();
 }
@@ -213,6 +212,7 @@ static NUM_CPUS: AtomicUsize = AtomicUsize::new(0);
 /// analogous to GOMAXPROCS in golang,
 /// can only be set once and before executor is running,
 /// if not set before executor running, it will be the number of available cpu in the host
+#[inline(always)]
 pub fn set_num_cpus(size: usize) -> Result<(), String> {
     let old_value = NUM_CPUS.compare_and_swap(0, size, Ordering::Relaxed);
     if old_value == 0 {
@@ -224,10 +224,12 @@ pub fn set_num_cpus(size: usize) -> Result<(), String> {
 
 /// get the number of executor thread,
 /// 0 if executor is not run yet
+#[inline(always)]
 pub fn get_num_cpus() -> usize {
     NUM_CPUS.load(Ordering::Relaxed)
 }
 
+#[inline(always)]
 fn lock_num_cpus() -> usize {
     let num_cpus = &NUM_CPUS;
     if num_cpus.load(Ordering::Relaxed) == 0 {
@@ -236,10 +238,12 @@ fn lock_num_cpus() -> usize {
     num_cpus.load(Ordering::Relaxed)
 }
 
+#[inline(always)]
 fn coprime(a: usize, b: usize) -> bool {
     gcd(a, b) == 1
 }
 
+#[inline(always)]
 fn gcd(a: usize, b: usize) -> usize {
     let mut p = (a, b);
     while p.1 != 0 {

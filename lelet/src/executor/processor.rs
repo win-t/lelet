@@ -93,6 +93,7 @@ impl Processor {
             trace!("{:?} is now running on {:?} on {:?}", self, machine, tid);
         });
 
+        let parker = self.parker.try_lock().unwrap();
         loop {
             qlock.flush_slot();
             if let Some(task) = machine.system.pop(&qlock.worker, self) {
@@ -126,7 +127,7 @@ impl Processor {
                 // 3. no more task for now, just sleep
                 self.sleeping.store(true, Ordering::Relaxed);
                 qlock = check!(self.without_qlock(machine, qlock, || {
-                    self.parker.try_lock().unwrap().park();
+                    parker.park();
                 }));
                 self.sleeping.store(false, Ordering::Relaxed);
             }
@@ -197,11 +198,11 @@ impl Processor {
     }
 
     #[inline(always)]
-    fn without_qlock<T>(
+    fn without_qlock(
         &self,
         machine: &Machine,
         qlock: SimpleLockGuard<Queue>,
-        f: impl FnOnce() -> T,
+        f: impl FnOnce(),
     ) -> Option<SimpleLockGuard<Queue>> {
         drop(qlock);
         f();

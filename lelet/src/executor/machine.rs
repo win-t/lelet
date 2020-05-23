@@ -56,8 +56,15 @@ impl Machine {
 
     #[inline(always)]
     fn run(self: &Rc<Machine>) {
-        CURRENT.with(|current| current.borrow_mut().replace(self.clone()));
-        defer! { CURRENT.with(|current| { current.borrow_mut().take() }); }
+        CURRENT.with(|current| {
+            let old = current.borrow_mut().replace(self.clone());
+
+            // just to make sure that the machine is not cached in thread pool
+            assert!(old.is_none());
+        });
+        defer! {
+            CURRENT.with(|current| { current.borrow_mut().take() });
+        }
 
         self.processor.run_on(self);
     }
@@ -77,6 +84,7 @@ impl Drop for Machine {
     }
 }
 
+#[inline(always)]
 pub fn spawn(system: &'static System, index: usize) {
     thread_pool::spawn_box(Box::new(move || {
         abort_on_panic(move || {
@@ -99,6 +107,7 @@ pub fn direct_push(task: Task) -> Result<(), Task> {
     })
 }
 
+#[inline(always)]
 pub fn respawn() {
     CURRENT.with(|current| {
         if let Some(m) = current.borrow_mut().take() {

@@ -124,6 +124,7 @@ impl Pool {
 }
 
 /// Spawn the job in the thread pool
+#[inline(always)]
 pub fn spawn_box(job: Job) {
     static POOL: Lazy<Pool> = Lazy::new(Pool::new);
     POOL.put_job(job);
