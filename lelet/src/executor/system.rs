@@ -2,14 +2,14 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use crossbeam_deque::Worker;
-use crossbeam_utils::CachePadded;
+use crossbeam_deque::{Steal, Worker};
+use crossbeam_utils::sync::{Parker, Unparker};
 use once_cell::sync::Lazy;
 
 #[cfg(feature = "tracing")]
 use log::trace;
 
-use lelet_utils::{abort_on_panic, Parker};
+use lelet_utils::{abort_on_panic, SimpleLock};
 
 use super::machine;
 use super::processor::Processor;
@@ -26,9 +26,10 @@ pub struct System {
     tick: AtomicU64,
 
     push_hint: AtomicUsize,
-    steal_hint: Vec<(CachePadded<AtomicUsize>, Vec<usize>)>,
+    steal_orders: Vec<Vec<usize>>,
 
-    parker: Parker,
+    parker: SimpleLock<Parker>,
+    unparker: Unparker,
 }
 
 // just to make sure
@@ -48,7 +49,7 @@ impl System {
             assert_eq!(i, p.index);
         }
 
-        let steal_hint: Vec<(CachePadded<AtomicUsize>, Vec<usize>)> = (3..)
+        let steal_orders: Vec<Vec<usize>> = (3..)
             .step_by(2)
             .filter(|&i| coprime(i, num_cpus))
             .take(num_cpus)
@@ -59,22 +60,26 @@ impl System {
                     .filter(move |&s| s != i)
                     .collect()
             })
-            .map(|o| (CachePadded::new(AtomicUsize::new(0)), o))
             .collect();
 
-        // just to make sure that steal_hint are valid
-        let sum: usize = (0..num_cpus).sum();
-        for (i, s) in steal_hint.iter().enumerate() {
-            assert_eq!(sum, i + s.1.iter().sum::<usize>());
+        // just to make sure that steal_orders are valid
+        let checksum: usize = (0..num_cpus).sum();
+        for (i, s) in steal_orders.iter().enumerate() {
+            assert_eq!(checksum, i + s.iter().sum::<usize>());
         }
+
+        let parker = Parker::new();
+        let unparker = parker.unparker().clone();
 
         System {
             processors,
-            steal_hint,
+            steal_orders,
 
-            tick: AtomicU64::new(0),
+            tick: AtomicU64::new(10),
             push_hint: AtomicUsize::new(0),
-            parker: Parker::default(),
+
+            parker: SimpleLock::new(parker),
+            unparker,
         }
     }
 
@@ -90,16 +95,20 @@ impl System {
 
         loop {
             if self.processors.iter().all(|p| p.is_sleeping()) {
-                self.parker.park();
+                self.parker.try_lock().unwrap().park();
             }
 
             let check_tick = self.tick.fetch_add(1, Ordering::Relaxed) + 1;
 
             thread::sleep(BLOCKING_THRESHOLD);
 
-            if !self.processors.iter().any(|p| p.is_sleeping()) {
-                for p in &self.processors {
-                    if p.get_last_seen() < check_tick {
+            let mut sleeping_processors = self.processors.iter().filter(|p| p.is_sleeping());
+
+            for p in &self.processors {
+                if p.get_last_seen() < check_tick {
+                    if let Some(p) = sleeping_processors.next() {
+                        p.wake_up();
+                    } else {
                         #[cfg(feature = "tracing")]
                         trace!("{:?} is blocked, spawn new machine for it", p);
 
@@ -111,48 +120,47 @@ impl System {
     }
 
     #[inline(always)]
-    pub fn sysmon_wake_up(&self) {
-        self.parker.unpark();
-    }
-
-    #[inline(always)]
-    fn next_push_index(&self) -> usize {
-        atomic_usize_add_mod(&self.push_hint, 1, self.processors.len())
-    }
-
-    #[inline(always)]
     pub fn push(&self, task: Task) {
-        let index = match machine::direct_push(task) {
-            Ok(current_index) => {
-                if self.processors.len() == 1 {
-                    current_index
-                } else {
-                    let mut index = self.next_push_index();
-                    if current_index == index {
-                        index = self.next_push_index();
-                    }
-                    index
-                }
-            }
+        match machine::direct_push(task) {
+            Ok(()) => {}
             Err(task) => {
                 let mut index = task.tag().get_index_hint();
                 if index >= self.processors.len() {
-                    index = self.next_push_index();
+                    loop {
+                        index = self.push_hint.load(Ordering::Relaxed);
+                        if self.push_hint.compare_and_swap(
+                            index,
+                            (index + 1) % self.processors.len(),
+                            Ordering::Relaxed,
+                        ) == index
+                        {
+                            break;
+                        }
+                    }
                 }
-                self.processors[index].push_global(task);
-                index
+
+                self.unparker.unpark();
+
+                let p = &self.processors[index];
+                p.push_global(task);
+                p.wake_up();
             }
         };
-
-        self.processors[index].wake_up();
     }
 
     #[inline(always)]
     pub fn pop(&self, worker: &Worker<Task>, processor: &Processor) -> Option<Task> {
-        let (_, steal_order) = &self.steal_hint[processor.index];
-        for &i in std::iter::once(&processor.index).chain(steal_order.iter()) {
-            if let Some(task) = self.processors[i].pop_global(worker) {
-                return Some(task);
+        let mut retry = true;
+        while retry {
+            retry = false;
+            for &index in
+                std::iter::once(&processor.index).chain(self.steal_orders[processor.index].iter())
+            {
+                match unsafe { self.processors.get_unchecked(index) }.pop_global(worker) {
+                    Steal::Success(task) => return Some(task),
+                    Steal::Empty => {}
+                    Steal::Retry => retry = true,
+                }
             }
         }
         None
@@ -160,15 +168,15 @@ impl System {
 
     #[inline(always)]
     pub fn steal(&self, worker: &Worker<Task>, processor: &Processor) -> Option<Task> {
-        if self.processors.len() == 1 {
-            return None;
-        }
-        let (steal_index, steal_order) = &self.steal_hint[processor.index];
-        let (l, r) = steal_order.split_at(atomic_usize_add_mod(steal_index, 1, steal_order.len()));
-        for (add, &i) in (r.iter().chain(l.iter())).enumerate() {
-            if let Some(task) = self.processors[i].steal_local(worker) {
-                atomic_usize_add_mod(steal_index, add, steal_order.len());
-                return Some(task);
+        let mut retry = true;
+        while retry {
+            retry = false;
+            for &index in &self.steal_orders[processor.index] {
+                match unsafe { self.processors.get_unchecked(index) }.steal_local(worker) {
+                    Steal::Success(task) => return Some(task),
+                    Steal::Empty => {}
+                    Steal::Retry => retry = true,
+                }
             }
         }
         None
@@ -190,14 +198,12 @@ pub fn get() -> &'static System {
     &SYSTEM
 }
 
-/// Mark current processor as blocking
+/// Detach current thread from executor pool
 ///
 /// this is useful if you know that you are going to do blocking that longer
 /// than blocking threshold.
-pub fn mark_blocking() {
-    if !get().processors.iter().any(|p| p.is_sleeping()) {
-        machine::respawn();
-    }
+pub fn detach_current_thread() {
+    machine::respawn();
 }
 
 static NUM_CPUS: AtomicUsize = AtomicUsize::new(0);
@@ -230,23 +236,11 @@ fn lock_num_cpus() -> usize {
     num_cpus.load(Ordering::Relaxed)
 }
 
-#[inline(always)]
-pub fn atomic_usize_add_mod(p: &AtomicUsize, i: usize, m: usize) -> usize {
-    let value = p.fetch_add(i, Ordering::Relaxed);
-    if value < m {
-        value
-    } else {
-        let new_value = value % m;
-        p.compare_and_swap(value + i, new_value + i, Ordering::Relaxed);
-        new_value
-    }
-}
-
-pub fn coprime(a: usize, b: usize) -> bool {
+fn coprime(a: usize, b: usize) -> bool {
     gcd(a, b) == 1
 }
 
-pub fn gcd(a: usize, b: usize) -> usize {
+fn gcd(a: usize, b: usize) -> usize {
     let mut p = (a, b);
     while p.1 != 0 {
         p = (p.1, p.0 % p.1);

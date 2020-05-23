@@ -18,7 +18,7 @@ mod task;
 pub use system::get_num_cpus;
 pub use system::set_num_cpus;
 
-pub use system::mark_blocking;
+pub use system::detach_current_thread;
 
 use std::future::Future;
 use std::pin::Pin;

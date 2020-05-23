@@ -86,19 +86,15 @@ pub fn spawn(system: &'static System, index: usize) {
 }
 
 #[inline(always)]
-pub fn direct_push(task: Task) -> Result<usize, Task> {
+pub fn direct_push(task: Task) -> Result<(), Task> {
     CURRENT.with(|current| {
         let mut current = current.borrow_mut();
         match current.as_ref() {
             None => Err(task),
-            Some(m) => m
-                .processor
-                .push_local(m, task)
-                .map(|()| m.processor.index)
-                .map_err(|err| {
-                    current.take();
-                    err
-                }),
+            Some(m) => m.processor.push_local(m, task).map_err(|err| {
+                current.take();
+                err
+            }),
         }
     })
 }

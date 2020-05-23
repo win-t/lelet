@@ -50,4 +50,4 @@ pub use executor::get_num_cpus;
 pub use executor::set_num_cpus;
 
 #[doc(hidden)]
-pub use executor::mark_blocking;
+pub use executor::detach_current_thread;
