@@ -96,16 +96,6 @@ impl System {
             .for_each(|p| machine::spawn(self, p.index));
 
         loop {
-            if self.processors.iter().all(|p| p.is_sleeping()) {
-                #[cfg(feature = "tracing")]
-                trace!("Sysmon entering sleep");
-                if let Some(parker) = self.parker.try_lock() {
-                    parker.park();
-                }
-                #[cfg(feature = "tracing")]
-                trace!("Sysmon exiting sleep");
-            }
-
             let check_tick = self.tick.fetch_add(1, Ordering::Relaxed) + 1;
 
             thread::sleep(BLOCKING_THRESHOLD);
@@ -128,6 +118,14 @@ impl System {
                         }
                     }
                 }
+            } else if self.processors.iter().all(|p| p.is_sleeping()) {
+                #[cfg(feature = "tracing")]
+                trace!("Sysmon entering sleep");
+                if let Some(parker) = self.parker.try_lock() {
+                    parker.park();
+                }
+                #[cfg(feature = "tracing")]
+                trace!("Sysmon exiting sleep");
             }
         }
     }
