@@ -100,8 +100,13 @@ impl System {
 
             thread::sleep(BLOCKING_THRESHOLD);
 
-            if self.processors.iter().any(|p| !p.is_empty()) {
-                let mut sleeping_processors = self.processors.iter().filter(|p| p.is_sleeping());
+            let index = self.push_hint.load(Ordering::Relaxed);
+            let processors = std::iter::once(&index)
+                .chain(unsafe { self.steal_orders.get_unchecked(index) }.iter())
+                .map(|&order_index| unsafe { self.processors.get_unchecked(order_index) });
+
+            if processors.clone().any(|p| !p.is_empty()) {
+                let mut sleeping_processors = processors.clone().filter(|p| p.is_sleeping());
 
                 for p in &self.processors {
                     if p.get_last_seen() < check_tick {
@@ -118,7 +123,7 @@ impl System {
                         }
                     }
                 }
-            } else if self.processors.iter().all(|p| p.is_sleeping()) {
+            } else if processors.clone().all(|p| p.is_sleeping()) {
                 #[cfg(feature = "tracing")]
                 trace!("Sysmon entering sleep");
                 if let Some(parker) = self.parker.try_lock() {
@@ -180,9 +185,16 @@ impl System {
         let mut retry = true;
         while retry {
             retry = false;
-            for &index in std::iter::once(&processor.index)
-                .chain(unsafe { self.steal_orders.get_unchecked(processor.index) }.iter())
-            {
+
+            // check dedicated global queue first
+            match unsafe { self.processors.get_unchecked(processor.index) }.pop_global(worker) {
+                Steal::Success(task) => return Some(task),
+                Steal::Empty => {}
+                Steal::Retry => retry = true,
+            }
+
+            // then steal from others global queue
+            for &index in unsafe { self.steal_orders.get_unchecked(processor.index) } {
                 match unsafe { self.processors.get_unchecked(index) }.pop_global(worker) {
                     Steal::Success(task) => return Some(task),
                     Steal::Empty => {}
