@@ -100,13 +100,8 @@ impl System {
 
             thread::sleep(BLOCKING_THRESHOLD);
 
-            let index = self.push_hint.load(Ordering::Relaxed);
-            let processors = std::iter::once(&index)
-                .chain(unsafe { self.steal_orders.get_unchecked(index) }.iter())
-                .map(|&order_index| unsafe { self.processors.get_unchecked(order_index) });
-
-            if processors.clone().any(|p| !p.is_empty()) {
-                let mut sleeping_processors = processors.clone().filter(|p| p.is_sleeping());
+            if self.processors.iter().any(|p| !p.is_empty()) {
+                let mut sleeping_processors = self.processors.iter().filter(|p| p.is_sleeping());
 
                 for p in &self.processors {
                     if p.get_last_seen() < check_tick {
@@ -123,7 +118,7 @@ impl System {
                         }
                     }
                 }
-            } else if processors.clone().all(|p| p.is_sleeping()) {
+            } else if self.processors.iter().all(|p| p.is_sleeping()) {
                 #[cfg(feature = "tracing")]
                 trace!("Sysmon entering sleep");
                 if let Some(parker) = self.parker.try_lock() {
