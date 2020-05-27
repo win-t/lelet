@@ -93,7 +93,7 @@ impl Processor {
 
         loop {
             qlock.flush_slot();
-            if let Some(task) = machine.system.pop(&qlock.worker, self) {
+            if let Some(task) = machine.system.pop_into(&qlock.worker, self) {
                 qlock = check!(self.run_task(machine, qlock, task));
             }
 
@@ -112,12 +112,12 @@ impl Processor {
                 // when local queue is empty:
 
                 // 1. get from global queue
-                if let Some(task) = machine.system.pop(&qlock.worker, self) {
+                if let Some(task) = machine.system.pop_into(&qlock.worker, self) {
                     run_task!(task);
                 }
 
                 // 2. steal from others
-                if let Some(task) = machine.system.steal(&qlock.worker, self) {
+                if let Some(task) = machine.system.steal_into(&qlock.worker, self) {
                     run_task!(task);
                 }
 

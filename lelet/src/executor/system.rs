@@ -42,6 +42,9 @@ impl Drop for System {
 
 impl System {
     fn new(num_cpus: usize) -> System {
+        #[cfg(feature = "tracing")]
+        trace!("Creating system");
+
         let processors: Vec<Processor> = (0..num_cpus).map(Processor::new).collect();
 
         let steal_orders: Vec<Vec<usize>> = (3..)
@@ -151,8 +154,9 @@ impl System {
     pub fn push(&self, task: Task) {
         match machine::direct_push(task) {
             Ok((index, counter)) => {
-                // wakeup others in case processors[index] need help
-                if counter > 1 {
+                if counter <= 1 {
+                    unsafe { self.processors.get_unchecked(index) }.wake_up();
+                } else {
                     let mut other_index = self.next_push_index();
                     if index == other_index {
                         other_index = self.next_push_index();
@@ -176,7 +180,7 @@ impl System {
     }
 
     #[inline(always)]
-    pub fn pop(&self, worker: &Worker<Task>, processor: &Processor) -> Option<Task> {
+    pub fn pop_into(&self, worker: &Worker<Task>, processor: &Processor) -> Option<Task> {
         let mut retry = true;
         while retry {
             retry = false;
@@ -201,7 +205,7 @@ impl System {
     }
 
     #[inline(always)]
-    pub fn steal(&self, worker: &Worker<Task>, processor: &Processor) -> Option<Task> {
+    pub fn steal_into(&self, worker: &Worker<Task>, processor: &Processor) -> Option<Task> {
         let mut retry = true;
         while retry {
             retry = false;
