@@ -65,6 +65,7 @@ impl System {
 
         // do some validity check
         // this will justify the usage of unsafe get_unchecked
+        assert!(processors.len() > 0);
         assert_eq!(processors.len(), steal_orders.len());
         for (i, p) in processors.iter().enumerate() {
             assert_eq!(i, p.index);
@@ -157,11 +158,15 @@ impl System {
                 if counter <= 1 {
                     unsafe { self.processors.get_unchecked(index) }.wake_up();
                 } else {
-                    let mut other_index = self.next_push_index();
-                    if index == other_index {
-                        other_index = self.next_push_index();
+                    let inc = counter - 1;
+                    let len = self.processors.len();
+                    if inc < len {
+                        let mut other_index = index + inc;
+                        if other_index >= len {
+                            other_index -= len;
+                        }
+                        unsafe { self.processors.get_unchecked(other_index) }.wake_up();
                     }
-                    unsafe { self.processors.get_unchecked(other_index) }.wake_up();
                 }
             }
             Err(task) => {
@@ -181,9 +186,8 @@ impl System {
 
     #[inline(always)]
     pub fn pop_into(&self, worker: &Worker<Task>, processor: &Processor) -> Option<Task> {
-        let mut retry = true;
-        while retry {
-            retry = false;
+        loop {
+            let mut retry = false;
 
             // check dedicated global queue first
             match unsafe { self.processors.get_unchecked(processor.index) }.pop_global(worker) {
@@ -200,15 +204,18 @@ impl System {
                     Steal::Retry => retry = true,
                 }
             }
+
+            if !retry {
+                return None;
+            }
         }
-        None
     }
 
     #[inline(always)]
     pub fn steal_into(&self, worker: &Worker<Task>, processor: &Processor) -> Option<Task> {
-        let mut retry = true;
-        while retry {
-            retry = false;
+        loop {
+            let mut retry = false;
+
             for &index in unsafe { self.steal_orders.get_unchecked(processor.index) } {
                 match unsafe { self.processors.get_unchecked(index) }.steal_local(worker) {
                     Steal::Success(task) => return Some(task),
@@ -216,8 +223,11 @@ impl System {
                     Steal::Retry => retry = true,
                 }
             }
+
+            if !retry {
+                return None;
+            }
         }
-        None
     }
 
     #[inline(always)]

@@ -18,8 +18,10 @@ pub struct Processor {
     pub index: usize,
 
     last_seen: AtomicU64,
+    sleeping: AtomicBool,
 
     current_machine: AtomicPtr<Machine>,
+    current_task: AtomicPtr<Task>,
 
     global: Injector<Task>,
     local: SimpleLock<Queue>,
@@ -27,7 +29,6 @@ pub struct Processor {
 
     parker: SimpleLock<Parker>,
     unparker: Unparker,
-    sleeping: AtomicBool,
 }
 
 impl Processor {
@@ -43,8 +44,10 @@ impl Processor {
             index,
 
             last_seen: AtomicU64::new(0),
+            sleeping: AtomicBool::new(false),
 
             current_machine: AtomicPtr::new(ptr::null_mut()),
+            current_task: AtomicPtr::new(ptr::null_mut()),
 
             global: Injector::new(),
             local: SimpleLock::new(local),
@@ -52,7 +55,6 @@ impl Processor {
 
             parker: SimpleLock::new(parker),
             unparker,
-            sleeping: AtomicBool::new(false),
         };
 
         #[cfg(feature = "tracing")]
@@ -85,6 +87,7 @@ impl Processor {
         let mut qlock = check!(self.try_acquire_qlock(machine));
 
         // reset
+        self.current_task.store(ptr::null_mut(), Ordering::Relaxed);
         self.last_seen.store(u64::MAX, Ordering::Relaxed);
         self.sleeping.store(false, Ordering::Relaxed);
 
@@ -155,8 +158,12 @@ impl Processor {
 
         task.tag().set_index_hint(self.index);
 
-        let mut woken = false;
-        qlock = match self.without_qlock(machine, qlock, || woken = task.run()) {
+        self.current_task
+            .store(task.tag() as *const _ as *mut _, Ordering::Relaxed);
+
+        qlock = match self.without_qlock(machine, qlock, || {
+            task.run();
+        }) {
             Some(qlock) => qlock,
             None => {
                 #[cfg(feature = "tracing")]
@@ -164,9 +171,8 @@ impl Processor {
                 return None;
             }
         };
-        if woken {
-            qlock.flush_slot();
-        }
+
+        self.current_task.store(ptr::null_mut(), Ordering::Relaxed);
 
         self.last_seen.store(u64::MAX, Ordering::Relaxed);
 
@@ -237,10 +243,21 @@ impl Processor {
         match self.try_acquire_qlock(machine) {
             None => Err(task),
             Some(mut qlock) => {
-                #[cfg(feature = "tracing")]
-                trace!("{:?} is pushed to {:?}'s local queue", task.tag(), self);
+                // do not push into slot when currently running task is rescheduled (yielding)
+                let into_slot = !ptr::eq(
+                    self.current_task.load(Ordering::Relaxed),
+                    task.tag() as *const _ as *mut _,
+                );
 
-                Ok(qlock.push(task))
+                #[cfg(feature = "tracing")]
+                trace!(
+                    "{:?} is pushed to {:?}'s local queue (into_slot={})",
+                    task.tag(),
+                    self,
+                    into_slot
+                );
+
+                Ok(qlock.push(task, into_slot))
             }
         }
     }
@@ -321,9 +338,13 @@ impl Queue {
     }
 
     #[inline(always)]
-    fn push(&mut self, task: Task) -> usize {
-        self.counter += 1;
-        self.slot.push(task);
+    fn push(&mut self, task: Task, into_slot: bool) -> usize {
+        if into_slot {
+            self.counter += 1;
+            self.slot.push(task);
+        } else {
+            self.worker.push(task);
+        }
         self.counter
     }
 }
