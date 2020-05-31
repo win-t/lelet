@@ -11,6 +11,7 @@ pub struct TaskTag {
 }
 
 impl TaskTag {
+    #[inline(always)]
     pub fn new() -> TaskTag {
         #[cfg(feature = "tracing")]
         static TASK_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);

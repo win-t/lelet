@@ -34,6 +34,7 @@ thread_local! {
 }
 
 impl Machine {
+    #[inline(always)]
     fn new(system: &'static System, index: usize) -> Rc<Machine> {
         #[cfg(feature = "tracing")]
         static MACHINE_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);

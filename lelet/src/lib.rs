@@ -26,3 +26,9 @@ pub use lelet_utils::block_on;
 
 #[doc(hidden)]
 pub use executor::detach_current_thread;
+
+#[doc(hidden)]
+#[inline(always)]
+pub async fn yield_now() {
+    lelet_utils::Yields(1).await;
+}

@@ -36,6 +36,7 @@ type Task = async_task::Task<TaskTag>;
 /// # Panic
 ///
 /// When a task panic, it will abort the entire program
+#[inline(always)]
 pub fn spawn<T, R>(task: T) -> JoinHandle<R>
 where
     T: Future<Output = R> + Send + 'static,
