@@ -65,7 +65,7 @@ impl System {
 
         // do some validity check
         // this will justify the usage of unsafe get_unchecked
-        assert!(processors.len() > 0);
+        assert!(!processors.is_empty());
         assert_eq!(processors.len(), steal_orders.len());
         for (i, p) in processors.iter().enumerate() {
             assert_eq!(i, p.index);
