@@ -13,10 +13,12 @@ use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 /// Call [`abort`] when `f` panic
 ///
 /// [`abort`]: https://doc.rust-lang.org/std/process/fn.abort.html
+#[inline(always)]
 pub fn abort_on_panic(f: impl FnOnce()) {
     struct Bomb;
 
     impl Drop for Bomb {
+        #[inline(always)]
         fn drop(&mut self) {
             abort();
         }
@@ -37,7 +39,8 @@ macro_rules! defer {
           struct Guard<F: FnOnce()>(Option<F>);
 
           impl<F: FnOnce()> Drop for Guard<F> {
-              fn drop(&mut self) {
+            #[inline(always)]
+            fn drop(&mut self) {
                   (self.0).take().map(|f| f());
               }
           }
@@ -69,6 +72,7 @@ pub struct Yields(pub usize);
 impl Future for Yields {
     type Output = ();
 
+    #[inline(always)]
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<()> {
         if self.0 == 0 {
             Poll::Ready(())
@@ -96,6 +100,7 @@ unsafe impl<T: ?Sized + Send> Sync for SimpleLock<T> {}
 
 impl<T> SimpleLock<T> {
     /// Returns a new SimpleLock initialized with `value`.
+    #[inline(always)]
     pub fn new(value: T) -> SimpleLock<T> {
         SimpleLock {
             locked: AtomicBool::new(false),
@@ -105,6 +110,7 @@ impl<T> SimpleLock<T> {
 }
 
 impl<T: ?Sized + Default> Default for SimpleLock<T> {
+    #[inline(always)]
     fn default() -> SimpleLock<T> {
         SimpleLock::new(T::default())
     }
@@ -126,6 +132,7 @@ impl<T: ?Sized> SimpleLock<T> {
 }
 
 impl<T: ?Sized + fmt::Debug> fmt::Debug for SimpleLock<T> {
+    #[inline(always)]
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.try_lock() {
             Some(guard) => f.debug_tuple("SimpleLock").field(&&*guard).finish(),
@@ -145,6 +152,7 @@ pub struct SimpleLockGuard<'a, T: 'a + ?Sized> {
 }
 
 impl<T: ?Sized> Drop for SimpleLockGuard<'_, T> {
+    #[inline(always)]
     fn drop(&mut self) {
         self.parent.locked.store(false, Ordering::Release);
     }
@@ -153,24 +161,28 @@ impl<T: ?Sized> Drop for SimpleLockGuard<'_, T> {
 impl<T: ?Sized> Deref for SimpleLockGuard<'_, T> {
     type Target = T;
 
+    #[inline(always)]
     fn deref(&self) -> &Self::Target {
         unsafe { &*self.parent.value.get() }
     }
 }
 
 impl<T: ?Sized> DerefMut for SimpleLockGuard<'_, T> {
+    #[inline(always)]
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { &mut *self.parent.value.get() }
     }
 }
 
 impl<T: ?Sized + fmt::Debug> fmt::Debug for SimpleLockGuard<'_, T> {
+    #[inline(always)]
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         fmt::Debug::fmt(&**self, f)
     }
 }
 
 /// Block current thread until f is complete
+#[inline(always)]
 pub fn block_on<F: Future>(mut f: F) -> F::Output {
     // originally copied from `extreme` (https://docs.rs/extreme)
 
@@ -180,11 +192,13 @@ pub fn block_on<F: Future>(mut f: F) -> F::Output {
 
     #[allow(clippy::mutex_atomic)]
     impl Parker {
+        #[inline(always)]
         fn unpark(self: &Parker) {
             *self.0.lock().unwrap() = true;
             self.1.notify_one();
         }
 
+        #[inline(always)]
         fn park(self: &Parker) {
             let mut runnable = self.0.lock().unwrap();
             while !*runnable {
@@ -197,6 +211,7 @@ pub fn block_on<F: Future>(mut f: F) -> F::Output {
     static VTABLE: RawWakerVTable = RawWakerVTable::new(
         //
         // clone: unsafe fn(*const ()) -> RawWaker
+        #[inline(always)]
         |parker| unsafe {
             let parker = Arc::from_raw(parker as *const Parker);
             let cloned_parker = parker.clone();
@@ -205,12 +220,15 @@ pub fn block_on<F: Future>(mut f: F) -> F::Output {
         },
         //
         // wake: unsafe fn(*const ())
+        #[inline(always)]
         |parker| unsafe { Arc::from_raw(parker as *const Parker).unpark() },
         //
         // wake_by_ref: unsafe fn(*const ())
+        #[inline(always)]
         |parker| unsafe { (&*(parker as *const Parker)).unpark() },
         //
         // drop: unsafe fn(*const ())
+        #[inline(always)]
         |parker| unsafe { drop(Arc::from_raw(parker as *const Parker)) },
     );
 
