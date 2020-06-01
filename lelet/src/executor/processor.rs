@@ -94,17 +94,24 @@ impl Processor {
         #[cfg(feature = "tracing")]
         trace!("{:?} is now running on {:?} ", self, machine);
 
+        let mut wake_up_other = true;
+
+        let backoff = if self.index == 0 {
+            Some(Backoff::new())
+        } else {
+            None
+        };
+
         loop {
-            let mut wakeup_other = true;
             qlock.flush_slot();
             if let Some(task) = machine.system.pop_into(&qlock.worker, self) {
-                qlock = check!(self.run_task(machine, qlock, &mut wakeup_other, task));
+                qlock = check!(self.run_task(machine, qlock, &mut wake_up_other, task));
             }
 
             for _ in 0..37 {
                 macro_rules! run_task {
                     ($task:expr) => {
-                        qlock = check!(self.run_task(machine, qlock, &mut wakeup_other, $task));
+                        qlock = check!(self.run_task(machine, qlock, &mut wake_up_other, $task));
                         continue;
                     };
                 }
@@ -126,19 +133,32 @@ impl Processor {
                 }
 
                 // 3. no more task for now, just sleep
-                #[cfg(feature = "tracing")]
-                trace!("{:?} entering sleep", self);
-                self.sleeping.store(true, Ordering::Relaxed);
-                qlock = check!(self.without_qlock(machine, qlock, || {
-                    if let Some(parker) = self.parker.try_lock() {
-                        parker.park();
-                    }
-                }));
-                self.sleeping.store(false, Ordering::Relaxed);
-                #[cfg(feature = "tracing")]
-                trace!("{:?} exiting sleep", self);
+                {
+                    wake_up_other = true;
 
-                break;
+                    if let Some(backoff) = backoff.as_ref() {
+                        if !backoff.is_completed() {
+                            backoff.snooze();
+                            continue;
+                        }
+                    }
+
+                    #[cfg(feature = "tracing")]
+                    trace!("{:?} entering sleep", self);
+                    self.sleeping.store(true, Ordering::Relaxed);
+                    qlock = check!(self.without_qlock(machine, qlock, || {
+                        if let Some(parker) = self.parker.try_lock() {
+                            parker.park();
+                        }
+                    }));
+                    self.sleeping.store(false, Ordering::Relaxed);
+                    #[cfg(feature = "tracing")]
+                    trace!("{:?} exiting sleep", self);
+
+                    if let Some(backoff) = backoff.as_ref() {
+                        backoff.reset();
+                    }
+                }
             }
         }
     }
@@ -148,7 +168,7 @@ impl Processor {
         &'a self,
         machine: &Machine,
         mut qlock: SimpleLockGuard<'a, Queue>,
-        wakeup_other: &mut bool,
+        wake_up_other: &mut bool,
         task: Task,
     ) -> Option<SimpleLockGuard<'a, Queue>> {
         #[cfg(feature = "tracing")]
@@ -165,15 +185,16 @@ impl Processor {
         self.current_task
             .store(task.tag() as *const _ as *mut _, Ordering::Relaxed);
 
-        // we are about to run a task that are might be blocking
-        // wake others to help
-        if *wakeup_other
-            && (!self.global.is_empty() || !qlock.worker.is_empty() || qlock.counter > 1)
-        {
+        // we are about to run a task that might be blocking
+        // wake other to help
+        if *wake_up_other && (!machine.system.is_empty()) {
             let processors = &machine.system.processors;
-            let help_index = (self.index + 1) % processors.len();
-            unsafe { processors.get_unchecked(help_index) }.wake_up();
-            *wakeup_other = false;
+            let mut other_index = self.index + 1;
+            if other_index == processors.len() {
+                other_index = 0;
+            }
+            unsafe { processors.get_unchecked(other_index) }.wake_up();
+            *wake_up_other = false;
         }
 
         qlock = match self.without_qlock(machine, qlock, || {
@@ -257,7 +278,7 @@ impl Processor {
     pub fn push_local(&self, machine: &Machine, task: Task) -> Result<(), Task> {
         match self.try_acquire_qlock(machine) {
             None => Err(task),
-            Some(mut qlock) => {
+            Some(qlock) => {
                 // do not push into slot when currently running task is rescheduled (yielding)
                 let into_slot = !ptr::eq(
                     self.current_task.load(Ordering::Relaxed),
@@ -265,12 +286,17 @@ impl Processor {
                 );
 
                 #[cfg(feature = "tracing")]
-                trace!(
-                    "{:?} is pushed to {:?}'s local queue (into_slot={})",
-                    task.tag(),
-                    self,
-                    into_slot
-                );
+                {
+                    if into_slot {
+                        trace!("{:?} is pushed to {:?}'s local queue", task.tag(), self);
+                    } else {
+                        trace!(
+                            "{:?} is pushed to {:?}'s local queue (yielding)",
+                            task.tag(),
+                            self
+                        );
+                    }
+                }
 
                 qlock.push(task, into_slot);
                 Ok(())
@@ -314,7 +340,6 @@ impl std::fmt::Debug for Processor {
 }
 
 struct Queue {
-    counter: usize,
     slot: Worker<Task>,
     worker: Worker<Task>,
 }
@@ -322,41 +347,29 @@ struct Queue {
 impl Queue {
     fn new() -> Queue {
         Queue {
-            counter: 0,
             slot: Worker::new_lifo(),
             worker: Worker::new_fifo(),
         }
     }
 
     #[inline(always)]
-    fn flush_slot(&mut self) {
+    fn flush_slot(&self) {
         let slot_stealer = self.slot.stealer();
         loop {
             if let Steal::Empty = slot_stealer.steal_batch(&self.worker) {
                 break;
             }
         }
-        self.counter = 0;
     }
 
     #[inline(always)]
-    fn pop(&mut self) -> Option<Task> {
-        self.slot
-            .pop()
-            .map(|t| {
-                self.counter -= 1;
-                t
-            })
-            .or_else(|| {
-                self.counter = 0;
-                self.worker.pop()
-            })
+    fn pop(&self) -> Option<Task> {
+        self.slot.pop().or_else(|| self.worker.pop())
     }
 
     #[inline(always)]
-    fn push(&mut self, task: Task, into_slot: bool) {
+    fn push(&self, task: Task, into_slot: bool) {
         if into_slot {
-            self.counter += 1;
             self.slot.push(task);
         } else {
             self.worker.push(task);

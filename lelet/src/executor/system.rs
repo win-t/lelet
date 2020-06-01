@@ -101,7 +101,7 @@ impl System {
 
             thread::sleep(BLOCKING_THRESHOLD);
 
-            if self.processors.iter().any(|p| !p.is_empty()) {
+            if !self.is_empty() {
                 let mut sleeping_processors = self.processors.iter().filter(|p| p.is_sleeping());
 
                 for p in &self.processors {
@@ -192,6 +192,11 @@ impl System {
                 return None;
             }
         }
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.processors.iter().all(|p| p.is_empty())
     }
 
     #[inline(always)]
