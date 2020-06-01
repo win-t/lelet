@@ -35,7 +35,7 @@ thread_local! {
 
 impl Machine {
     #[inline(always)]
-    fn new(system: &'static System, index: usize) -> Rc<Machine> {
+    fn new(system: &'static System, processor: &'static Processor) -> Rc<Machine> {
         #[cfg(feature = "tracing")]
         static MACHINE_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -44,7 +44,7 @@ impl Machine {
             id: MACHINE_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
 
             system,
-            processor: &system.processors[index],
+            processor,
 
             _marker: PhantomData,
         };
@@ -91,10 +91,10 @@ impl Drop for Machine {
 }
 
 #[inline(always)]
-pub fn spawn(system: &'static System, index: usize) {
+pub fn spawn(system: &'static System, processor: &'static Processor) {
     thread_pool::spawn_box(Box::new(move || {
         abort_on_panic(move || {
-            Machine::new(system, index).run();
+            Machine::new(system, processor).run();
         })
     }));
 }
@@ -128,7 +128,7 @@ pub fn respawn() {
                 m.processor
             );
 
-            spawn(m.system, m.processor.index)
+            spawn(m.system, m.processor)
         }
     })
 }

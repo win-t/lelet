@@ -95,9 +95,7 @@ impl System {
         trace!("Sysmon is running");
 
         // spawn machine for every processor
-        self.processors
-            .iter()
-            .for_each(|p| machine::spawn(self, p.index));
+        self.processors.iter().for_each(|p| machine::spawn(self, p));
 
         loop {
             let check_tick = self.tick.fetch_add(1, Ordering::Relaxed) + 1;
@@ -118,7 +116,7 @@ impl System {
                             #[cfg(feature = "tracing")]
                             trace!("{:?} is blocked, spawn new machine for it", p);
 
-                            machine::spawn(self, p.index);
+                            machine::spawn(self, p);
                         }
                     }
                 }
@@ -134,19 +132,19 @@ impl System {
         }
     }
 
+    // will always in range 0..processors.len()
+    // this will justify the usage of unsafe get_unchecked
     #[inline(always)]
-    fn next_push_index(&self) -> usize {
-        // will always in range 0..processors.len()
-        // this will justify the usage of unsafe get_unchecked
+    fn next_push_hint(&self) -> usize {
         loop {
-            let index = self.push_hint.load(Ordering::Relaxed);
+            let push_hint = self.push_hint.load(Ordering::Relaxed);
             if self.push_hint.compare_and_swap(
-                index,
-                (index + 1) % self.processors.len(),
+                push_hint,
+                (push_hint + 1) % self.processors.len(),
                 Ordering::Relaxed,
-            ) == index
+            ) == push_hint
             {
-                break index;
+                break push_hint;
             }
         }
     }
@@ -172,7 +170,7 @@ impl System {
             Err(task) => {
                 let mut index = task.tag().get_index_hint();
                 if index >= self.processors.len() {
-                    index = self.next_push_index();
+                    index = self.next_push_hint();
                 }
 
                 self.unparker.unpark();
