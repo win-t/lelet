@@ -1,10 +1,11 @@
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::ptr;
+use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Once;
 use std::thread;
 use std::time::Duration;
 
 use crossbeam_deque::{Steal, Worker};
 use crossbeam_utils::sync::{Parker, Unparker};
-use once_cell::sync::Lazy;
 
 #[cfg(feature = "tracing")]
 use log::trace;
@@ -25,7 +26,6 @@ pub struct System {
     /// for blocking detection
     tick: AtomicU64,
 
-    push_hint: AtomicUsize,
     steal_orders: Vec<Vec<usize>>,
 
     parker: SimpleLock<Parker>,
@@ -60,9 +60,6 @@ impl System {
             })
             .collect();
 
-        let parker = Parker::new();
-        let unparker = parker.unparker().clone();
-
         // do some validity check
         // this will justify the usage of unsafe get_unchecked
         assert!(!processors.is_empty());
@@ -77,12 +74,14 @@ impl System {
                 .into_sorted_vec()));
         }
 
+        let parker = Parker::new();
+        let unparker = parker.unparker().clone();
+
         System {
             processors,
             steal_orders,
 
             tick: AtomicU64::new(0),
-            push_hint: AtomicUsize::new(0),
 
             parker: SimpleLock::new(parker),
             unparker,
@@ -132,52 +131,19 @@ impl System {
         }
     }
 
-    // will always in range 0..processors.len()
-    // this will justify the usage of unsafe get_unchecked
-    #[inline(always)]
-    fn next_push_hint(&self) -> usize {
-        loop {
-            let push_hint = self.push_hint.load(Ordering::Relaxed);
-            if self.push_hint.compare_and_swap(
-                push_hint,
-                (push_hint + 1) % self.processors.len(),
-                Ordering::Relaxed,
-            ) == push_hint
-            {
-                break push_hint;
-            }
-        }
-    }
-
     #[inline(always)]
     pub fn push(&self, task: Task) {
         match machine::direct_push(task) {
-            Ok((index, counter)) => {
-                if counter <= 1 {
-                    unsafe { self.processors.get_unchecked(index) }.wake_up();
-                } else {
-                    let inc = counter - 1;
-                    let len = self.processors.len();
-                    if inc < len {
-                        let mut other_index = index + inc;
-                        if other_index >= len {
-                            other_index -= len;
-                        }
-                        unsafe { self.processors.get_unchecked(other_index) }.wake_up();
-                    }
-                }
-            }
+            Ok(()) => {}
             Err(task) => {
                 let mut index = task.tag().get_index_hint();
                 if index >= self.processors.len() {
-                    index = self.next_push_hint();
+                    index = 0;
                 }
+                unsafe { &self.processors.get_unchecked(index) }.push_global(task);
 
                 self.unparker.unpark();
-
-                let p = unsafe { &self.processors.get_unchecked(index) };
-                p.push_global(task);
-                p.wake_up();
+                unsafe { &self.processors.get_unchecked(0) }.wake_up();
             }
         }
     }
@@ -236,12 +202,14 @@ impl System {
 
 #[inline(always)]
 pub fn get() -> &'static System {
-    static SYSTEM: Lazy<System> = Lazy::new(|| {
+    static SYSTEM: (AtomicPtr<System>, Once) = (AtomicPtr::new(ptr::null_mut()), Once::new());
+    SYSTEM.1.call_once(|| {
         thread::spawn(move || abort_on_panic(move || get().sysmon_run()));
-        System::new(lock_num_cpus())
+        let system = Box::into_raw(Box::new(System::new(lock_num_cpus())));
+        SYSTEM.0.store(system, Ordering::Relaxed);
     });
 
-    &SYSTEM
+    unsafe { &*SYSTEM.0.load(Ordering::Relaxed) }
 }
 
 /// Detach current thread from executor pool

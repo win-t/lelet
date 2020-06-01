@@ -95,15 +95,16 @@ impl Processor {
         trace!("{:?} is now running on {:?} ", self, machine);
 
         loop {
+            let mut wakeup_other = true;
             qlock.flush_slot();
             if let Some(task) = machine.system.pop_into(&qlock.worker, self) {
-                qlock = check!(self.run_task(machine, qlock, task));
+                qlock = check!(self.run_task(machine, qlock, &mut wakeup_other, task));
             }
 
             for _ in 0..37 {
                 macro_rules! run_task {
                     ($task:expr) => {
-                        qlock = check!(self.run_task(machine, qlock, $task));
+                        qlock = check!(self.run_task(machine, qlock, &mut wakeup_other, $task));
                         continue;
                     };
                 }
@@ -136,6 +137,8 @@ impl Processor {
                 self.sleeping.store(false, Ordering::Relaxed);
                 #[cfg(feature = "tracing")]
                 trace!("{:?} exiting sleep", self);
+
+                break;
             }
         }
     }
@@ -145,6 +148,7 @@ impl Processor {
         &'a self,
         machine: &Machine,
         mut qlock: SimpleLockGuard<'a, Queue>,
+        wakeup_other: &mut bool,
         task: Task,
     ) -> Option<SimpleLockGuard<'a, Queue>> {
         #[cfg(feature = "tracing")]
@@ -160,6 +164,17 @@ impl Processor {
 
         self.current_task
             .store(task.tag() as *const _ as *mut _, Ordering::Relaxed);
+
+        // we are about to run a task that are might be blocking
+        // wake others to help
+        if *wakeup_other
+            && (!self.global.is_empty() || !qlock.worker.is_empty() || qlock.counter > 1)
+        {
+            let processors = &machine.system.processors;
+            let help_index = (self.index + 1) % processors.len();
+            unsafe { processors.get_unchecked(help_index) }.wake_up();
+            *wakeup_other = false;
+        }
 
         qlock = match self.without_qlock(machine, qlock, || {
             task.run();
@@ -239,7 +254,7 @@ impl Processor {
     }
 
     #[inline(always)]
-    pub fn push_local(&self, machine: &Machine, task: Task) -> Result<usize, Task> {
+    pub fn push_local(&self, machine: &Machine, task: Task) -> Result<(), Task> {
         match self.try_acquire_qlock(machine) {
             None => Err(task),
             Some(mut qlock) => {
@@ -257,7 +272,8 @@ impl Processor {
                     into_slot
                 );
 
-                Ok(qlock.push(task, into_slot))
+                qlock.push(task, into_slot);
+                Ok(())
             }
         }
     }
@@ -338,13 +354,12 @@ impl Queue {
     }
 
     #[inline(always)]
-    fn push(&mut self, task: Task, into_slot: bool) -> usize {
+    fn push(&mut self, task: Task, into_slot: bool) {
         if into_slot {
             self.counter += 1;
             self.slot.push(task);
         } else {
             self.worker.push(task);
         }
-        self.counter
     }
 }

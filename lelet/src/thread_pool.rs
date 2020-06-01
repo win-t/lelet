@@ -3,12 +3,13 @@
 //! The size of thread pool is unbounded, it will always spawn new thread
 //! when no thread available to run the job
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::ptr;
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::Once;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TrySendError};
-use once_cell::sync::Lazy;
 
 #[cfg(feature = "tracing")]
 use std::cell::Cell;
@@ -126,6 +127,10 @@ impl Pool {
 /// Spawn the job in the thread pool
 #[inline(always)]
 pub fn spawn_box(job: Job) {
-    static POOL: Lazy<Pool> = Lazy::new(Pool::new);
-    POOL.put_job(job);
+    static POOL: (AtomicPtr<Pool>, Once) = (AtomicPtr::new(ptr::null_mut()), Once::new());
+    POOL.1.call_once(|| {
+        let pool = Box::into_raw(Box::new(Pool::new()));
+        POOL.0.store(pool, Ordering::Relaxed);
+    });
+    unsafe { &*POOL.0.load(Ordering::Relaxed) }.put_job(job);
 }
