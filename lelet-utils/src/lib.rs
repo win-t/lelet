@@ -129,6 +129,12 @@ impl<T: ?Sized> SimpleLock<T> {
             })
         }
     }
+
+    /// Try to lock.
+    #[inline(always)]
+    pub fn is_locked(&self) -> bool {
+        self.locked.load(Ordering::Relaxed)
+    }
 }
 
 impl<T: ?Sized + fmt::Debug> fmt::Debug for SimpleLock<T> {
