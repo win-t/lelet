@@ -1,9 +1,11 @@
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
-use crossbeam_utils::sync::{Parker, Unparker};
 use crossbeam_utils::Backoff;
+
+#[cfg(feature = "tracing")]
+use std::sync::atomic::AtomicUsize;
 
 #[cfg(feature = "tracing")]
 use log::trace;
@@ -11,14 +13,18 @@ use log::trace;
 use lelet_utils::{SimpleLock, SimpleLockGuard};
 
 use super::machine::Machine;
+use super::system::System;
 use super::Task;
 
 /// Processor is the one who run the task
 pub struct Processor {
-    pub index: usize,
+    #[cfg(feature = "tracing")]
+    pub id: usize,
+
+    system: Option<&'static System>,
+    others: Vec<&'static Processor>,
 
     last_seen: AtomicU64,
-    sleeping: AtomicBool,
 
     current_machine: AtomicPtr<Machine>,
     current_task: AtomicPtr<Task>,
@@ -26,25 +32,25 @@ pub struct Processor {
     global: Injector<Task>,
     local: SimpleLock<Queue>,
     stealers: [Stealer<Task>; 2],
-
-    parker: SimpleLock<Parker>,
-    unparker: Unparker,
 }
 
 impl Processor {
-    pub fn new(index: usize) -> Processor {
+    pub fn new() -> Processor {
+        #[cfg(feature = "tracing")]
+        static PROCESSOR_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
         let local = Queue::new();
         let stealers = [local.worker.stealer(), local.slot.stealer()];
 
-        let parker = Parker::new();
-        let unparker = parker.unparker().clone();
-
         #[allow(clippy::let_and_return)]
         let processor = Processor {
-            index,
+            #[cfg(feature = "tracing")]
+            id: PROCESSOR_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+
+            system: None,
+            others: vec![],
 
             last_seen: AtomicU64::new(0),
-            sleeping: AtomicBool::new(false),
 
             current_machine: AtomicPtr::new(ptr::null_mut()),
             current_task: AtomicPtr::new(ptr::null_mut()),
@@ -52,15 +58,22 @@ impl Processor {
             global: Injector::new(),
             local: SimpleLock::new(local),
             stealers,
-
-            parker: SimpleLock::new(parker),
-            unparker,
         };
 
         #[cfg(feature = "tracing")]
         trace!("{:?} is created", processor);
 
         processor
+    }
+
+    #[inline(always)]
+    pub fn set_system(&mut self, system: &'static System, others: Vec<&'static Processor>) {
+        let old = self.system.replace(system);
+
+        // can only be set once
+        assert!(old.is_none());
+
+        self.others = others;
     }
 
     #[inline(always)]
@@ -74,44 +87,31 @@ impl Processor {
             };
         }
 
-        // just to make sure system and processor have consistent index
-        assert!(ptr::eq(self, &machine.system.processors[self.index]));
-
         // steal this processor from old machine
         self.current_machine
             .store(machine as *const _ as *mut _, Ordering::Relaxed);
-
-        // in case old machine it is sleeping
-        self.wake_up();
 
         let mut qlock = check!(self.try_acquire_qlock(machine));
 
         // reset
         self.current_task.store(ptr::null_mut(), Ordering::Relaxed);
         self.last_seen.store(u64::MAX, Ordering::Relaxed);
-        self.sleeping.store(false, Ordering::Relaxed);
 
         #[cfg(feature = "tracing")]
         trace!("{:?} is now running on {:?} ", self, machine);
 
-        let mut wake_up_other = true;
-
-        let backoff = if self.index == 0 {
-            Some(Backoff::new())
-        } else {
-            None
-        };
+        let system = self.system.unwrap();
 
         loop {
             qlock.flush_slot();
-            if let Some(task) = machine.system.pop_into(&qlock.worker, self) {
-                qlock = check!(self.run_task(machine, qlock, &mut wake_up_other, task));
+            if let Some(task) = self.pop_global(&qlock.worker) {
+                qlock = check!(self.run_task(machine, qlock, system.now(), task));
             }
 
-            for _ in 0..37 {
+            for _ in 0..61 {
                 macro_rules! run_task {
                     ($task:expr) => {
-                        qlock = check!(self.run_task(machine, qlock, &mut wake_up_other, $task));
+                        qlock = check!(self.run_task(machine, qlock, system.now(), $task));
                         continue;
                     };
                 }
@@ -123,42 +123,37 @@ impl Processor {
                 // when local queue is empty:
 
                 // 1. get from global queue
-                if let Some(task) = machine.system.pop_into(&qlock.worker, self) {
+                if let Some(task) = self.pop_global(&qlock.worker) {
                     run_task!(task);
                 }
 
                 // 2. steal from others
-                if let Some(task) = machine.system.steal_into(&qlock.worker, self) {
+                if let Some(task) = self.steal_others(&qlock.worker) {
                     run_task!(task);
                 }
 
                 // 3. no more task for now, just sleep
                 {
-                    wake_up_other = true;
-
-                    if let Some(backoff) = backoff.as_ref() {
-                        if !backoff.is_completed() {
-                            backoff.snooze();
-                            continue;
-                        }
-                    }
-
                     #[cfg(feature = "tracing")]
                     trace!("{:?} entering sleep", self);
-                    self.sleeping.store(true, Ordering::Relaxed);
-                    qlock = check!(self.without_qlock(machine, qlock, || {
-                        if let Some(parker) = self.parker.try_lock() {
-                            parker.park();
+
+                    qlock = check!(match self.without_qlock(machine, qlock, || {
+                        system.processors_wait_notif();
+                    }) {
+                        Some(qlock) => Some(qlock),
+                        None => {
+                            // we consume the notification without acquiring qlock
+                            // resend it so others will get it
+                            system.processors_send_notif();
+                            None
                         }
-                    }));
-                    self.sleeping.store(false, Ordering::Relaxed);
+                    });
+
                     #[cfg(feature = "tracing")]
                     trace!("{:?} exiting sleep", self);
-
-                    if let Some(backoff) = backoff.as_ref() {
-                        backoff.reset();
-                    }
                 }
+
+                break;
             }
         }
     }
@@ -168,7 +163,7 @@ impl Processor {
         &'a self,
         machine: &Machine,
         mut qlock: SimpleLockGuard<'a, Queue>,
-        wake_up_other: &mut bool,
+        now: u64,
         task: Task,
     ) -> Option<SimpleLockGuard<'a, Queue>> {
         #[cfg(feature = "tracing")]
@@ -177,27 +172,13 @@ impl Processor {
         #[cfg(feature = "tracing")]
         trace!("{} is running on {:?} on {:?}", task_info, self, machine);
 
-        self.last_seen
-            .store(machine.system.now(), Ordering::Relaxed);
-
-        task.tag().set_index_hint(self.index);
+        self.last_seen.store(now, Ordering::Relaxed);
 
         self.current_task
             .store(task.tag() as *const _ as *mut _, Ordering::Relaxed);
 
-        // we are about to run a task that might be blocking
-        // wake other to help
-        if *wake_up_other && (!machine.system.is_empty()) {
-            let processors = &machine.system.processors;
-            let mut other_index = self.index + 1;
-            if other_index == processors.len() {
-                other_index = 0;
-            }
-            unsafe { processors.get_unchecked(other_index) }.wake_up();
-            *wake_up_other = false;
-        }
-
         qlock = match self.without_qlock(machine, qlock, || {
+            task.tag().set_processor_hint(self);
             task.run();
         }) {
             Some(qlock) => qlock,
@@ -265,51 +246,60 @@ impl Processor {
     }
 
     #[inline(always)]
-    pub fn is_sleeping(&self) -> bool {
-        self.sleeping.load(Ordering::Relaxed)
-    }
-
-    #[inline(always)]
-    pub fn wake_up(&self) {
-        self.unparker.unpark();
-    }
-
-    #[inline(always)]
     pub fn push_local(&self, machine: &Machine, task: Task) -> Result<(), Task> {
         match self.try_acquire_qlock(machine) {
             None => Err(task),
             Some(qlock) => {
-                // do not push into slot when currently running task is rescheduled (yielding)
-                let into_slot = !ptr::eq(
+                // if currently running task is rescheduled, it mean yielding
+                if ptr::eq(
                     self.current_task.load(Ordering::Relaxed),
                     task.tag() as *const _ as *mut _,
-                );
+                ) {
+                    #[cfg(feature = "tracing")]
+                    trace!(
+                        "{:?} is pushed to {:?}'s local queue (yielding)",
+                        task.tag(),
+                        self
+                    );
 
-                #[cfg(feature = "tracing")]
-                {
-                    if into_slot {
-                        trace!("{:?} is pushed to {:?}'s local queue", task.tag(), self);
-                    } else {
-                        trace!(
-                            "{:?} is pushed to {:?}'s local queue (yielding)",
-                            task.tag(),
-                            self
-                        );
-                    }
+                    qlock.push_into_worker(task);
+                } else {
+                    #[cfg(feature = "tracing")]
+                    trace!("{:?} is pushed to {:?}'s local queue", task.tag(), self);
+
+                    qlock.push_into_slot(task);
                 }
 
-                qlock.push(task, into_slot);
                 Ok(())
             }
         }
     }
 
     #[inline(always)]
-    pub fn steal_local(&self, worker: &Worker<Task>) -> Steal<Task> {
+    fn steal(&self, worker: &Worker<Task>) -> Steal<Task> {
         match self.stealers[0].steal_batch_and_pop(worker) {
             Steal::Success(task) => Steal::Success(task),
             Steal::Empty => self.stealers[1].steal_batch_and_pop(worker),
             Steal::Retry => Steal::Retry,
+        }
+    }
+
+    #[inline(always)]
+    fn steal_others(&self, worker: &Worker<Task>) -> Option<Task> {
+        loop {
+            let mut retry = false;
+
+            for p in &self.others {
+                match p.steal(worker) {
+                    Steal::Success(task) => return Some(task),
+                    Steal::Empty => {}
+                    Steal::Retry => retry = true,
+                }
+            }
+
+            if !retry {
+                return None;
+            }
         }
     }
 
@@ -322,8 +312,30 @@ impl Processor {
     }
 
     #[inline(always)]
-    pub fn pop_global(&self, worker: &Worker<Task>) -> Steal<Task> {
-        self.global.steal_batch_and_pop(worker)
+    fn pop_global(&self, worker: &Worker<Task>) -> Option<Task> {
+        loop {
+            let mut retry = false;
+
+            // check dedicated global queue first
+            match self.global.steal_batch_and_pop(worker) {
+                Steal::Success(task) => return Some(task),
+                Steal::Empty => {}
+                Steal::Retry => retry = true,
+            }
+
+            // then steal from others global queue
+            for p in &self.others {
+                match p.global.steal_batch_and_pop(worker) {
+                    Steal::Success(task) => return Some(task),
+                    Steal::Empty => {}
+                    Steal::Retry => retry = true,
+                }
+            }
+
+            if !retry {
+                return None;
+            }
+        }
     }
 
     #[inline(always)]
@@ -335,7 +347,7 @@ impl Processor {
 #[cfg(feature = "tracing")]
 impl std::fmt::Debug for Processor {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str(&format!("Processor({})", self.index))
+        f.write_str(&format!("Processor({})", self.id))
     }
 }
 
@@ -368,11 +380,12 @@ impl Queue {
     }
 
     #[inline(always)]
-    fn push(&self, task: Task, into_slot: bool) {
-        if into_slot {
-            self.slot.push(task);
-        } else {
-            self.worker.push(task);
-        }
+    fn push_into_slot(&self, task: Task) {
+        self.slot.push(task);
+    }
+
+    #[inline(always)]
+    fn push_into_worker(&self, task: Task) {
+        self.worker.push(task);
     }
 }

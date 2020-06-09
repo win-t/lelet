@@ -14,7 +14,6 @@ use lelet_utils::defer;
 use crate::thread_pool;
 
 use super::processor::Processor;
-use super::system::System;
 use super::Task;
 
 /// Machine is the one who have OS thread
@@ -22,7 +21,6 @@ pub struct Machine {
     #[cfg(feature = "tracing")]
     pub id: usize,
 
-    pub system: &'static System,
     processor: &'static Processor,
 
     // !Send + !Sync
@@ -35,7 +33,7 @@ thread_local! {
 
 impl Machine {
     #[inline(always)]
-    fn new(system: &'static System, processor: &'static Processor) -> Rc<Machine> {
+    fn new(processor: &'static Processor) -> Rc<Machine> {
         #[cfg(feature = "tracing")]
         static MACHINE_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -43,7 +41,6 @@ impl Machine {
             #[cfg(feature = "tracing")]
             id: MACHINE_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
 
-            system,
             processor,
 
             _marker: PhantomData,
@@ -91,10 +88,10 @@ impl Drop for Machine {
 }
 
 #[inline(always)]
-pub fn spawn(system: &'static System, processor: &'static Processor) {
+pub fn spawn(processor: &'static Processor) {
     thread_pool::spawn_box(Box::new(move || {
         abort_on_panic(move || {
-            Machine::new(system, processor).run();
+            Machine::new(processor).run();
         })
     }));
 }
@@ -105,10 +102,13 @@ pub fn direct_push(task: Task) -> Result<(), Task> {
         let mut current = current.borrow_mut();
         match current.as_ref() {
             None => Err(task),
-            Some(m) => m.processor.push_local(m, task).map_err(|err| {
-                current.take();
-                err
-            }),
+            Some(m) => match m.processor.push_local(m, task) {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    current.take();
+                    Err(err)
+                }
+            },
         }
     })
 }
@@ -124,7 +124,7 @@ pub fn respawn() {
                 m.processor
             );
 
-            spawn(m.system, m.processor)
+            spawn(m.processor)
         }
     })
 }

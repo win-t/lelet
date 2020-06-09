@@ -4,7 +4,7 @@ use std::sync::Once;
 use std::thread;
 use std::time::Duration;
 
-use crossbeam_deque::{Steal, Worker};
+use crossbeam_queue::{ArrayQueue, PopError};
 use crossbeam_utils::sync::{Parker, Unparker};
 
 #[cfg(feature = "tracing")]
@@ -21,31 +21,34 @@ const BLOCKING_THRESHOLD: Duration = Duration::from_millis(10);
 
 pub struct System {
     /// all processors
-    pub processors: Vec<Processor>,
+    processors: Vec<Processor>,
 
     /// for blocking detection
     tick: AtomicU64,
 
-    steal_orders: Vec<Vec<usize>>,
-
     parker: SimpleLock<Parker>,
     unparker: Unparker,
+
+    parker_list: Vec<(SimpleLock<Parker>, Unparker)>,
+    free_parker: ArrayQueue<&'static (SimpleLock<Parker>, Unparker)>,
+    used_parker: ArrayQueue<&'static (SimpleLock<Parker>, Unparker)>,
 }
 
 // just to make sure
 impl Drop for System {
     fn drop(&mut self) {
-        eprintln!("System should not be dropped once created");
+        eprintln!("System must not be dropped once created");
         std::process::abort();
     }
 }
 
 impl System {
-    fn new(num_cpus: usize) -> System {
+    /// create new system and leak it
+    fn new(num_cpus: usize) -> &'static System {
         #[cfg(feature = "tracing")]
         trace!("Creating system");
 
-        let processors: Vec<Processor> = (0..num_cpus).map(Processor::new).collect();
+        let processors: Vec<Processor> = (0..num_cpus).map(|_| Processor::new()).collect();
 
         let steal_orders: Vec<Vec<usize>> = (3..)
             .step_by(2)
@@ -60,13 +63,18 @@ impl System {
             })
             .collect();
 
+        let parker_list: Vec<(SimpleLock<Parker>, Unparker)> = (0..num_cpus)
+            .map(|_| {
+                let parker = Parker::new();
+                let unparker = parker.unparker().clone();
+                (SimpleLock::new(parker), unparker)
+            })
+            .collect();
+
         // do some validity check
-        // this will justify the usage of unsafe get_unchecked
         assert!(!processors.is_empty());
         assert_eq!(processors.len(), steal_orders.len());
-        for (i, p) in processors.iter().enumerate() {
-            assert_eq!(i, p.index);
-        }
+        assert_eq!(processors.len(), parker_list.len());
         for (i, s) in steal_orders.iter().enumerate() {
             assert!((0..num_cpus).eq(std::iter::once(i)
                 .chain(s.clone().into_iter())
@@ -77,15 +85,37 @@ impl System {
         let parker = Parker::new();
         let unparker = parker.unparker().clone();
 
-        System {
-            processors,
-            steal_orders,
+        // we need fix memory location to pass to System::free_parker and Processor::set_system
+        // alloc in heap, and leak it
+        let system: &'static System = {
+            let system = Box::into_raw(Box::new(System {
+                processors,
 
-            tick: AtomicU64::new(0),
+                tick: AtomicU64::new(0),
 
-            parker: SimpleLock::new(parker),
-            unparker,
+                parker: SimpleLock::new(parker),
+                unparker,
+
+                parker_list,
+                free_parker: ArrayQueue::new(num_cpus),
+                used_parker: ArrayQueue::new(num_cpus),
+            }));
+            unsafe { &*system }
+        };
+
+        for p in &system.parker_list {
+            system.free_parker.push(p).unwrap();
         }
+
+        for (i, p) in system.processors.iter().enumerate() {
+            let others: Vec<&'static Processor> = steal_orders[i]
+                .iter()
+                .map(|&j| &system.processors[j])
+                .collect();
+            unsafe { &mut *(p as *const _ as *mut Processor) }.set_system(system, others);
+        }
+
+        system
     }
 
     #[inline(always)]
@@ -94,40 +124,65 @@ impl System {
         trace!("Sysmon is running");
 
         // spawn machine for every processor
-        self.processors.iter().for_each(|p| machine::spawn(self, p));
+        self.processors.iter().for_each(machine::spawn);
+
+        let parker = self.parker.try_lock().unwrap();
 
         loop {
             let check_tick = self.tick.fetch_add(1, Ordering::Relaxed) + 1;
 
             thread::sleep(BLOCKING_THRESHOLD);
 
-            if !self.is_empty() {
-                let mut sleeping_processors = self.processors.iter().filter(|p| p.is_sleeping());
-
+            if !self.processors.iter().all(|p| p.is_empty()) {
                 for p in &self.processors {
                     if p.get_last_seen() < check_tick {
-                        if let Some(other) = sleeping_processors.next() {
-                            #[cfg(feature = "tracing")]
-                            trace!("{:?} is blocked, waking up {:?}", p, other);
+                        #[cfg(feature = "tracing")]
+                        trace!("{:?} is blocked, spawn new machine for it", p);
 
-                            other.wake_up();
-                        } else {
-                            #[cfg(feature = "tracing")]
-                            trace!("{:?} is blocked, spawn new machine for it", p);
-
-                            machine::spawn(self, p);
-                        }
+                        machine::spawn(p);
                     }
                 }
-            } else if self.processors.iter().all(|p| p.is_sleeping()) {
+            } else {
                 #[cfg(feature = "tracing")]
                 trace!("Sysmon entering sleep");
-                if let Some(parker) = self.parker.try_lock() {
-                    parker.park();
-                }
+
+                parker.park();
+
                 #[cfg(feature = "tracing")]
                 trace!("Sysmon exiting sleep");
             }
+        }
+    }
+
+    #[inline(always)]
+    pub fn processors_wait_notif(&self) {
+        if let Some(parker) = match self.free_parker.pop() {
+            Err(PopError) => None,
+            Ok(p) => match p.0.try_lock() {
+                Some(parker) => {
+                    self.used_parker.push(p).unwrap();
+                    Some(parker)
+                }
+                None => {
+                    self.free_parker.push(p).unwrap();
+                    None
+                }
+            },
+        } {
+            parker.park();
+        }
+    }
+
+    #[inline(always)]
+    pub fn processors_send_notif(&self) {
+        if let Some(unparker) = match self.used_parker.pop() {
+            Err(PopError) => None,
+            Ok(p) => {
+                self.free_parker.push(p).unwrap();
+                Some(&p.1)
+            }
+        } {
+            unparker.unpark();
         }
     }
 
@@ -136,67 +191,17 @@ impl System {
         match machine::direct_push(task) {
             Ok(()) => {}
             Err(task) => {
-                let mut index = task.tag().get_index_hint();
-                if index >= self.processors.len() {
-                    index = 0;
+                let mut p = task.tag().processor_hint();
+                if p.is_null() {
+                    p = unsafe { self.processors.get_unchecked(0) };
                 }
-                unsafe { &self.processors.get_unchecked(index) }.push_global(task);
 
-                self.unparker.unpark();
-                unsafe { &self.processors.get_unchecked(0) }.wake_up();
+                unsafe { &*p }.push_global(task);
             }
         }
-    }
 
-    #[inline(always)]
-    pub fn pop_into(&self, worker: &Worker<Task>, processor: &Processor) -> Option<Task> {
-        loop {
-            let mut retry = false;
-
-            // check dedicated global queue first
-            match unsafe { self.processors.get_unchecked(processor.index) }.pop_global(worker) {
-                Steal::Success(task) => return Some(task),
-                Steal::Empty => {}
-                Steal::Retry => retry = true,
-            }
-
-            // then steal from others global queue
-            for &index in unsafe { self.steal_orders.get_unchecked(processor.index) } {
-                match unsafe { self.processors.get_unchecked(index) }.pop_global(worker) {
-                    Steal::Success(task) => return Some(task),
-                    Steal::Empty => {}
-                    Steal::Retry => retry = true,
-                }
-            }
-
-            if !retry {
-                return None;
-            }
-        }
-    }
-
-    #[inline(always)]
-    pub fn steal_into(&self, worker: &Worker<Task>, processor: &Processor) -> Option<Task> {
-        loop {
-            let mut retry = false;
-
-            for &index in unsafe { self.steal_orders.get_unchecked(processor.index) } {
-                match unsafe { self.processors.get_unchecked(index) }.steal_local(worker) {
-                    Steal::Success(task) => return Some(task),
-                    Steal::Empty => {}
-                    Steal::Retry => retry = true,
-                }
-            }
-
-            if !retry {
-                return None;
-            }
-        }
-    }
-
-    #[inline(always)]
-    pub fn is_empty(&self) -> bool {
-        self.processors.iter().all(|p| p.is_empty())
+        self.unparker.unpark();
+        self.processors_send_notif();
     }
 
     #[inline(always)]
@@ -210,7 +215,7 @@ pub fn get() -> &'static System {
     static SYSTEM: (AtomicPtr<System>, Once) = (AtomicPtr::new(ptr::null_mut()), Once::new());
     SYSTEM.1.call_once(|| {
         thread::spawn(move || abort_on_panic(move || get().sysmon_run()));
-        let system = Box::into_raw(Box::new(System::new(lock_num_cpus())));
+        let system = System::new(lock_num_cpus()) as *const _ as *mut _;
         SYSTEM.0.store(system, Ordering::Relaxed);
     });
 

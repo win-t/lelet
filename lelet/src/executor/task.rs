@@ -1,4 +1,7 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::ptr;
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+
+use super::processor::Processor;
 
 #[cfg(feature = "tracing")]
 use log::trace;
@@ -7,7 +10,7 @@ pub struct TaskTag {
     #[cfg(feature = "tracing")]
     id: usize,
 
-    index_hint: AtomicUsize,
+    processor_hint: AtomicPtr<Processor>,
 }
 
 impl TaskTag {
@@ -21,7 +24,7 @@ impl TaskTag {
             #[cfg(feature = "tracing")]
             id: TASK_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
 
-            index_hint: AtomicUsize::new(usize::MAX),
+            processor_hint: AtomicPtr::new(ptr::null_mut()),
         };
 
         #[cfg(feature = "tracing")]
@@ -31,13 +34,14 @@ impl TaskTag {
     }
 
     #[inline(always)]
-    pub fn get_index_hint(&self) -> usize {
-        self.index_hint.load(Ordering::Relaxed)
+    pub fn processor_hint(&self) -> *const Processor {
+        self.processor_hint.load(Ordering::Relaxed)
     }
 
     #[inline(always)]
-    pub fn set_index_hint(&self, index: usize) {
-        self.index_hint.store(index, Ordering::Relaxed);
+    pub fn set_processor_hint(&self, processor: *const Processor) {
+        self.processor_hint
+            .store(processor as *mut _, Ordering::Relaxed);
     }
 }
 
