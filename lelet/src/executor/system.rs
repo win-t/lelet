@@ -87,32 +87,41 @@ impl System {
 
         // we need fix memory location to pass to System::free_parker and Processor::set_system
         // alloc in heap, and leak it
-        let system: &'static System = {
-            let system = Box::into_raw(Box::new(System {
-                processors,
+        let system_raw = Box::into_raw(Box::new(System {
+            processors,
 
-                tick: AtomicU64::new(0),
+            tick: AtomicU64::new(0),
 
-                parker: SimpleLock::new(parker),
-                unparker,
+            parker: SimpleLock::new(parker),
+            unparker,
 
-                parker_list,
-                free_parker: ArrayQueue::new(num_cpus),
-                used_parker: ArrayQueue::new(num_cpus),
-            }));
-            unsafe { &*system }
-        };
+            parker_list,
+            free_parker: ArrayQueue::new(num_cpus),
+            used_parker: ArrayQueue::new(num_cpus),
+        }));
+
+        let system: &'static System = unsafe { &*system_raw };
 
         for p in &system.parker_list {
             system.free_parker.push(p).unwrap();
         }
 
-        for (i, p) in system.processors.iter().enumerate() {
+        // although we broke reference invariant (mutable and immutable
+        // are live in same time) here, this is safe because
+        // we only use mutable reference to call Processor::set_system,
+        // there is no way to other code (and other thread) to observe
+        // this broken invariant.
+        for (i, p) in unsafe { &mut *system_raw }
+            .processors
+            .iter_mut()
+            .enumerate()
+        {
             let others: Vec<&'static Processor> = steal_orders[i]
                 .iter()
                 .map(|&j| &system.processors[j])
                 .collect();
-            unsafe { &mut *(p as *const _ as *mut Processor) }.set_system(system, others);
+
+            p.set_system(system, others);
         }
 
         system

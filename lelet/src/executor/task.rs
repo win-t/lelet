@@ -1,7 +1,10 @@
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 use super::processor::Processor;
+
+#[cfg(feature = "tracing")]
+use std::sync::atomic::AtomicUsize;
 
 #[cfg(feature = "tracing")]
 use log::trace;
