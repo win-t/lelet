@@ -106,12 +106,12 @@ impl System {
             .map(|(i, o)| Some((i, o.iter().map(|&i| &system.processors[i]).collect())))
             .collect();
 
-        // although we broke reference invariant (mutable and immutable
-        // are live in same time) here, this is safe because
-        // we only use mutable reference to call Processor::set_system,
-        // we doesn't provide public direct/indirect access to System::processors element
-        // and System::processors element is unique
-        // so other module will not observe this broken invariant
+        // although we temporary broke the reference invariant (mutable and immutable
+        // are live in same time) here, this is safe because:
+        // we only use mutable reference to call Processor::set_system(system, others),
+        // we doesn't provide public direct/indirect access to System::processors[i]
+        // from first argument, and in second argument, others[i] doesn't contain System::processors[i]
+        // so code outside this block will not observe this broken invariant
         for (i, p) in unsafe { &mut *system_raw }
             .processors
             .iter_mut()
@@ -131,10 +131,11 @@ impl System {
         #[cfg(feature = "tracing")]
         trace!("Sysmon is running");
 
+        // this will also ensure that only one sysmon thread is running
+        let parker = self.parker.try_lock().unwrap();
+
         // spawn machine for every processor
         self.processors.iter().for_each(machine::spawn);
-
-        let parker = self.parker.try_lock().unwrap();
 
         loop {
             let check_tick = self.tick.fetch_add(1, Ordering::Relaxed) + 1;
@@ -176,6 +177,7 @@ impl System {
                 if self.is_empty() {
                     parker.park();
                 }
+                break;
             }
         }
     }
