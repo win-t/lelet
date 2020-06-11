@@ -102,7 +102,7 @@ impl Processor {
 
         let system = self.system.unwrap();
 
-        const YIELD_LIMIT: usize = 1;
+        const YIELD_LIMIT: usize = 4;
         let mut yield_counter = YIELD_LIMIT;
 
         macro_rules! self_run_task {

@@ -4,7 +4,6 @@ use std::sync::Once;
 use std::thread;
 use std::time::Duration;
 
-use crossbeam_queue::SegQueue;
 use crossbeam_utils::sync::{Parker, Unparker};
 
 #[cfg(feature = "tracing")]
@@ -26,11 +25,11 @@ pub struct System {
     /// for blocking detection
     tick: AtomicU64,
 
-    parker: SimpleLock<Parker>,
-    unparker: Unparker,
+    sysmon_parker: SimpleLock<Parker>,
+    sysmon_unparker: Unparker,
 
     parker_list: Vec<(SimpleLock<Parker>, Unparker)>,
-    waiting_list: SegQueue<&'static (SimpleLock<Parker>, Unparker)>,
+    parker_index: AtomicUsize,
 }
 
 // just to make sure
@@ -81,8 +80,8 @@ impl System {
                 .into_sorted_vec()));
         }
 
-        let parker = Parker::new();
-        let unparker = parker.unparker().clone();
+        let sysmon_parker = Parker::new();
+        let sysmon_unparker = sysmon_parker.unparker().clone();
 
         // we need fix memory location to pass to System::free_parker and Processor::set_system
         // alloc in heap, and leak it
@@ -91,11 +90,11 @@ impl System {
 
             tick: AtomicU64::new(0),
 
-            parker: SimpleLock::new(parker),
-            unparker,
+            sysmon_parker: SimpleLock::new(sysmon_parker),
+            sysmon_unparker,
 
             parker_list,
-            waiting_list: SegQueue::new(),
+            parker_index: AtomicUsize::new(0),
         }));
 
         let system: &'static System = unsafe { &*system_raw };
@@ -132,7 +131,7 @@ impl System {
         trace!("Sysmon is running");
 
         // this will also ensure that only one sysmon thread is running
-        let parker = self.parker.try_lock().unwrap();
+        let parker = self.sysmon_parker.try_lock().unwrap();
 
         // spawn machine for every processor
         self.processors.iter().for_each(machine::spawn);
@@ -169,15 +168,25 @@ impl System {
     }
 
     #[inline(always)]
-    pub fn processors_wait_notif(&'static self) {
-        for p in &self.parker_list {
+    pub fn processors_wait_notif(&self) {
+        for (i, p) in self.parker_list.iter().enumerate() {
             if let Some(parker) = p.0.try_lock() {
-                self.waiting_list.push(p);
-                std::sync::atomic::fence(Ordering::SeqCst);
-                if self.is_empty() {
-                    parker.park();
+                loop {
+                    let index = self.parker_index.load(Ordering::Relaxed);
+                    if i > index {
+                        if self
+                            .parker_index
+                            .compare_and_swap(index, i, Ordering::Relaxed)
+                            == index
+                        {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
                 }
-                break;
+                parker.park();
+                return;
             }
         }
     }
@@ -185,17 +194,18 @@ impl System {
     #[inline(always)]
     pub fn processors_send_notif(&self) {
         loop {
-            let pop_again;
-
-            if let Ok(p) = self.waiting_list.pop() {
-                pop_again = !p.0.is_locked(); // already unparked
-                p.1.unpark();
+            let index = self.parker_index.load(Ordering::Relaxed);
+            unsafe { self.parker_list.get_unchecked(index) }.1.unpark();
+            if index > 0 {
+                if self
+                    .parker_index
+                    .compare_and_swap(index, index - 1, Ordering::Relaxed)
+                    == index
+                {
+                    break;
+                }
             } else {
-                return;
-            }
-
-            if !pop_again {
-                return;
+                break;
             }
         }
     }
@@ -214,7 +224,7 @@ impl System {
             }
         }
 
-        self.unparker.unpark();
+        self.sysmon_unparker.unpark();
         self.processors_send_notif();
     }
 
@@ -232,7 +242,6 @@ pub fn get() -> &'static System {
         let system = System::new(lock_num_cpus()) as *const _ as *mut _;
         SYSTEM.0.store(system, Ordering::Relaxed);
     });
-
     unsafe { &*SYSTEM.0.load(Ordering::Relaxed) }
 }
 

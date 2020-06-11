@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use log::trace;
 
 use lelet_utils::abort_on_panic;
-use lelet_utils::defer;
 
 use crate::thread_pool;
 
@@ -60,9 +59,6 @@ impl Machine {
             // just to make sure that the machine is not cached in thread pool
             assert!(old.is_none());
         });
-        defer! {
-            CURRENT.with(|current| { current.borrow_mut().take() });
-        }
 
         #[cfg(feature = "tracing")]
         crate::thread_pool::THREAD_ID.with(|tid| {
@@ -70,6 +66,8 @@ impl Machine {
         });
 
         self.processor.run_on(self);
+
+        CURRENT.with(|current| current.borrow_mut().take());
     }
 }
 
