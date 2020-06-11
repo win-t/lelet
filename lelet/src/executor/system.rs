@@ -4,7 +4,7 @@ use std::sync::Once;
 use std::thread;
 use std::time::Duration;
 
-use crossbeam_queue::{ArrayQueue, PopError};
+use crossbeam_queue::SegQueue;
 use crossbeam_utils::sync::{Parker, Unparker};
 
 #[cfg(feature = "tracing")]
@@ -30,8 +30,7 @@ pub struct System {
     unparker: Unparker,
 
     parker_list: Vec<(SimpleLock<Parker>, Unparker)>,
-    free_parker: ArrayQueue<&'static (SimpleLock<Parker>, Unparker)>,
-    used_parker: ArrayQueue<&'static (SimpleLock<Parker>, Unparker)>,
+    waiting_list: SegQueue<&'static (SimpleLock<Parker>, Unparker)>,
 }
 
 // just to make sure
@@ -96,32 +95,32 @@ impl System {
             unparker,
 
             parker_list,
-            free_parker: ArrayQueue::new(num_cpus),
-            used_parker: ArrayQueue::new(num_cpus),
+            waiting_list: SegQueue::new(),
         }));
 
         let system: &'static System = unsafe { &*system_raw };
 
-        for p in &system.parker_list {
-            system.free_parker.push(p).unwrap();
-        }
+        let mut others: Vec<Option<(usize, Vec<&'static Processor>)>> = steal_orders
+            .iter()
+            .enumerate()
+            .map(|(i, o)| Some((i, o.iter().map(|&i| &system.processors[i]).collect())))
+            .collect();
 
         // although we broke reference invariant (mutable and immutable
         // are live in same time) here, this is safe because
         // we only use mutable reference to call Processor::set_system,
-        // there is no way to other code (and other thread) to observe
-        // this broken invariant.
+        // we doesn't provide public direct/indirect access to System::processors element
+        // and System::processors element is unique
+        // so other module will not observe this broken invariant
         for (i, p) in unsafe { &mut *system_raw }
             .processors
             .iter_mut()
             .enumerate()
         {
-            let others: Vec<&'static Processor> = steal_orders[i]
-                .iter()
-                .map(|&j| &system.processors[j])
-                .collect();
+            let o = others[i].take().unwrap();
+            assert_eq!(i, o.0);
 
-            p.set_system(system, others);
+            p.set_system(system, o.1);
         }
 
         system
@@ -142,7 +141,7 @@ impl System {
 
             thread::sleep(BLOCKING_THRESHOLD);
 
-            if !self.processors.iter().all(|p| p.is_empty()) {
+            if !self.is_empty() {
                 for p in &self.processors {
                     if p.get_last_seen() < check_tick {
                         #[cfg(feature = "tracing")]
@@ -164,34 +163,38 @@ impl System {
     }
 
     #[inline(always)]
-    pub fn processors_wait_notif(&self) {
-        if let Some(parker) = match self.free_parker.pop() {
-            Err(PopError) => None,
-            Ok(p) => match p.0.try_lock() {
-                Some(parker) => {
-                    self.used_parker.push(p).unwrap();
-                    Some(parker)
+    fn is_empty(&self) -> bool {
+        self.processors.iter().all(|p| p.is_empty())
+    }
+
+    #[inline(always)]
+    pub fn processors_wait_notif(&'static self) {
+        for p in &self.parker_list {
+            if let Some(parker) = p.0.try_lock() {
+                self.waiting_list.push(p);
+                std::sync::atomic::fence(Ordering::SeqCst);
+                if self.is_empty() {
+                    parker.park();
                 }
-                None => {
-                    self.free_parker.push(p).unwrap();
-                    None
-                }
-            },
-        } {
-            parker.park();
+            }
         }
     }
 
     #[inline(always)]
     pub fn processors_send_notif(&self) {
-        if let Some(unparker) = match self.used_parker.pop() {
-            Err(PopError) => None,
-            Ok(p) => {
-                self.free_parker.push(p).unwrap();
-                Some(&p.1)
+        loop {
+            let pop_again;
+
+            if let Ok(p) = self.waiting_list.pop() {
+                pop_again = !p.0.is_locked(); // already unparked
+                p.1.unpark();
+            } else {
+                return;
             }
-        } {
-            unparker.unpark();
+
+            if !pop_again {
+                return;
+            }
         }
     }
 

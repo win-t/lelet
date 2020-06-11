@@ -102,16 +102,26 @@ impl Processor {
 
         let system = self.system.unwrap();
 
+        const YIELD_LIMIT: usize = 1;
+        let mut yield_counter = YIELD_LIMIT;
+
+        macro_rules! self_run_task {
+            ($task:expr) => {
+                yield_counter = YIELD_LIMIT;
+                qlock = check!(self.run_task(machine, qlock, system.now(), $task));
+            };
+        }
+
         loop {
             qlock.flush_slot();
             if let Some(task) = self.pop_global(&qlock.worker) {
-                qlock = check!(self.run_task(machine, qlock, system.now(), task));
+                self_run_task!(task);
             }
 
             for _ in 0..61 {
                 macro_rules! run_task {
                     ($task:expr) => {
-                        qlock = check!(self.run_task(machine, qlock, system.now(), $task));
+                        self_run_task!($task);
                         continue;
                     };
                 }
@@ -133,7 +143,10 @@ impl Processor {
                 }
 
                 // 3. no more task for now, just sleep
-                {
+                if yield_counter > 0 {
+                    yield_counter -= 1;
+                    std::thread::yield_now();
+                } else {
                     #[cfg(feature = "tracing")]
                     trace!("{:?} entering sleep", self);
 
