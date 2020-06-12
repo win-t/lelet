@@ -169,7 +169,15 @@ impl System {
 
     #[inline(always)]
     pub fn processors_wait_notif(&self) {
-        for (i, p) in self.parker_list.iter().enumerate() {
+        let index = self.parker_index.load(Ordering::Relaxed);
+        for (i, p) in self
+            .parker_list
+            .iter()
+            .enumerate()
+            .cycle()
+            .skip(index)
+            .take(self.parker_list.len())
+        {
             if let Some(parker) = p.0.try_lock() {
                 loop {
                     let index = self.parker_index.load(Ordering::Relaxed);
