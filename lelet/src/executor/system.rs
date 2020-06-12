@@ -83,7 +83,7 @@ impl System {
         let sysmon_parker = Parker::new();
         let sysmon_unparker = sysmon_parker.unparker().clone();
 
-        // we need fix memory location to pass to System::free_parker and Processor::set_system
+        // we need fix memory location to pass to Processor::set_system
         // alloc in heap, and leak it
         let system_raw = Box::into_raw(Box::new(System {
             processors,
