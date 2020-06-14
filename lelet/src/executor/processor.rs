@@ -102,12 +102,8 @@ impl Processor {
 
         let system = self.system.unwrap();
 
-        const YIELD_LIMIT: usize = 1;
-        let mut yield_counter = YIELD_LIMIT;
-
         macro_rules! self_run_task {
             ($task:expr) => {
-                yield_counter = YIELD_LIMIT;
                 qlock = check!(self.run_task(machine, qlock, system.now(), $task));
             };
         }
@@ -143,24 +139,11 @@ impl Processor {
                 }
 
                 // 3. no more task for now, just sleep
-                if yield_counter > 0 {
-                    yield_counter -= 1;
-                    std::thread::yield_now();
-                } else {
+                {
                     #[cfg(feature = "tracing")]
                     trace!("{:?} entering sleep", self);
 
-                    qlock = check!(match self.without_qlock(machine, qlock, || {
-                        system.processors_wait_notif();
-                    }) {
-                        Some(qlock) => Some(qlock),
-                        None => {
-                            // we consume the notification without acquiring qlock
-                            // resend it so others will get it
-                            system.processors_send_notif();
-                            None
-                        }
-                    });
+                    system.processors_wait_notif();
 
                     #[cfg(feature = "tracing")]
                     trace!("{:?} exiting sleep", self);

@@ -1,10 +1,11 @@
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Once;
+use std::sync::{Mutex, MutexGuard, Once};
 use std::thread;
 use std::time::Duration;
 
 use crossbeam_utils::sync::{Parker, Unparker};
+use crossbeam_utils::CachePadded;
 
 #[cfg(feature = "tracing")]
 use log::trace;
@@ -28,8 +29,9 @@ pub struct System {
     sysmon_parker: SimpleLock<Parker>,
     sysmon_unparker: Unparker,
 
-    parker_list: Vec<(SimpleLock<Parker>, Unparker)>,
-    parker_index: AtomicUsize,
+    processors_parker: Mutex<Parker>,
+    processors_unparker: Unparker,
+    notif_count: CachePadded<AtomicUsize>,
 }
 
 // just to make sure
@@ -61,18 +63,9 @@ impl System {
             })
             .collect();
 
-        let parker_list: Vec<(SimpleLock<Parker>, Unparker)> = (0..num_cpus)
-            .map(|_| {
-                let parker = Parker::new();
-                let unparker = parker.unparker().clone();
-                (SimpleLock::new(parker), unparker)
-            })
-            .collect();
-
         // do some validity check
         assert!(!processors.is_empty());
         assert_eq!(processors.len(), steal_orders.len());
-        assert_eq!(processors.len(), parker_list.len());
         for (i, s) in steal_orders.iter().enumerate() {
             assert!((0..num_cpus).eq(std::iter::once(i)
                 .chain(s.clone().into_iter())
@@ -82,6 +75,9 @@ impl System {
 
         let sysmon_parker = Parker::new();
         let sysmon_unparker = sysmon_parker.unparker().clone();
+
+        let processors_parker = Parker::new();
+        let processors_unparker = processors_parker.unparker().clone();
 
         // we need fix memory location to pass to Processor::set_system
         // alloc in heap, and leak it
@@ -93,8 +89,9 @@ impl System {
             sysmon_parker: SimpleLock::new(sysmon_parker),
             sysmon_unparker,
 
-            parker_list,
-            parker_index: AtomicUsize::new(0),
+            processors_parker: Mutex::new(processors_parker),
+            processors_unparker,
+            notif_count: CachePadded::new(AtomicUsize::new(0)),
         }));
 
         let system: &'static System = unsafe { &*system_raw };
@@ -169,32 +166,25 @@ impl System {
 
     #[inline(always)]
     pub fn processors_wait_notif(&self) {
-        let index = self.parker_index.load(Ordering::Relaxed);
-        for (i, p) in self
-            .parker_list
-            .iter()
-            .enumerate()
-            .cycle()
-            .skip(index)
-            .take(self.parker_list.len())
-        {
-            if let Some(parker) = p.0.try_lock() {
-                loop {
-                    let index = self.parker_index.load(Ordering::Relaxed);
-                    if i > index {
-                        if self
-                            .parker_index
-                            .compare_and_swap(index, i, Ordering::Relaxed)
-                            == index
-                        {
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
+        let mut lock: Option<MutexGuard<Parker>> = None;
+        loop {
+            let notif_count = self.notif_count.load(Ordering::Relaxed);
+            if notif_count > 0 {
+                if self.notif_count.compare_and_swap(
+                    notif_count,
+                    notif_count - 1,
+                    Ordering::Relaxed,
+                ) == notif_count
+                {
+                    drop(lock);
+                    break;
                 }
-                parker.park();
-                return;
+            } else {
+                if let Some(parker) = lock.as_ref() {
+                    parker.park();
+                } else {
+                    lock = Some(self.processors_parker.lock().unwrap());
+                }
             }
         }
     }
@@ -202,17 +192,16 @@ impl System {
     #[inline(always)]
     pub fn processors_send_notif(&self) {
         loop {
-            let index = self.parker_index.load(Ordering::Relaxed);
-            unsafe { self.parker_list.get_unchecked(index) }.1.unpark();
-            if index > 0 {
-                if self
-                    .parker_index
-                    .compare_and_swap(index, index - 1, Ordering::Relaxed)
-                    == index
-                {
-                    break;
-                }
-            } else {
+            let notif_count = self.notif_count.load(Ordering::Relaxed);
+            if notif_count >= self.processors.len() {
+                break;
+            }
+            if self
+                .notif_count
+                .compare_and_swap(notif_count, notif_count + 1, Ordering::Relaxed)
+                == notif_count
+            {
+                self.processors_unparker.unpark();
                 break;
             }
         }
