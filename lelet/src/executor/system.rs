@@ -179,11 +179,11 @@ impl System {
                     drop(lock);
                     break;
                 }
+                std::sync::atomic::spin_loop_hint();
             } else {
-                if let Some(parker) = lock.as_ref() {
-                    parker.park();
-                } else {
-                    lock = Some(self.processors_parker.lock().unwrap());
+                match lock.as_ref() {
+                    Some(parker) => parker.park(),
+                    None => lock = Some(self.processors_parker.lock().unwrap()),
                 }
             }
         }
@@ -204,6 +204,7 @@ impl System {
                 self.processors_unparker.unpark();
                 break;
             }
+            std::sync::atomic::spin_loop_hint();
         }
     }
 
