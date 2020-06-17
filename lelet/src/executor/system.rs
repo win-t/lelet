@@ -1,11 +1,10 @@
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard, Once};
+use std::sync::{Mutex, Once};
 use std::thread;
 use std::time::Duration;
 
 use crossbeam_utils::sync::{Parker, Unparker};
-use crossbeam_utils::CachePadded;
 
 #[cfg(feature = "tracing")]
 use log::trace;
@@ -31,7 +30,6 @@ pub struct System {
 
     processors_parker: Mutex<Parker>,
     processors_unparker: Unparker,
-    notif_count: CachePadded<AtomicUsize>,
 }
 
 // just to make sure
@@ -91,7 +89,6 @@ impl System {
 
             processors_parker: Mutex::new(processors_parker),
             processors_unparker,
-            notif_count: CachePadded::new(AtomicUsize::new(0)),
         }));
 
         let system: &'static System = unsafe { &*system_raw };
@@ -161,51 +158,22 @@ impl System {
 
     #[inline(always)]
     fn is_empty(&self) -> bool {
-        self.processors.iter().all(|p| p.is_empty())
+        self.global_is_empty() && self.processors.iter().all(|p| p.local_is_empty())
+    }
+
+    #[inline(always)]
+    pub fn global_is_empty(&self) -> bool {
+        self.processors.iter().all(|p| p.global_is_empty())
     }
 
     #[inline(always)]
     pub fn processors_wait_notif(&self) {
-        let mut lock: Option<MutexGuard<Parker>> = None;
-        loop {
-            let notif_count = self.notif_count.load(Ordering::Relaxed);
-            if notif_count > 0 {
-                if self.notif_count.compare_and_swap(
-                    notif_count,
-                    notif_count - 1,
-                    Ordering::Relaxed,
-                ) == notif_count
-                {
-                    drop(lock);
-                    break;
-                }
-                std::sync::atomic::spin_loop_hint();
-            } else {
-                match lock.as_ref() {
-                    Some(parker) => parker.park(),
-                    None => lock = Some(self.processors_parker.lock().unwrap()),
-                }
-            }
-        }
+        self.processors_parker.lock().unwrap().park();
     }
 
     #[inline(always)]
     pub fn processors_send_notif(&self) {
-        loop {
-            let notif_count = self.notif_count.load(Ordering::Relaxed);
-            if notif_count >= self.processors.len() {
-                break;
-            }
-            if self
-                .notif_count
-                .compare_and_swap(notif_count, notif_count + 1, Ordering::Relaxed)
-                == notif_count
-            {
-                self.processors_unparker.unpark();
-                break;
-            }
-            std::sync::atomic::spin_loop_hint();
-        }
+        self.processors_unparker.unpark();
     }
 
     #[inline(always)]

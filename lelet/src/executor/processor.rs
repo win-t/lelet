@@ -101,9 +101,22 @@ impl Processor {
         trace!("{:?} is now running on {:?} ", self, machine);
 
         let system = self.system.unwrap();
+        let mut check_for_help = true;
 
         macro_rules! self_run_task {
             ($task:expr) => {
+                // we are going to run task that might be blocking
+                // wake others processor in case we need help
+                if check_for_help {
+                    if !qlock.worker.is_empty()
+                        || !qlock.slot.is_empty()
+                        || !system.global_is_empty()
+                    {
+                        check_for_help = false;
+                        system.processors_send_notif();
+                    }
+                }
+
                 qlock = check!(self.run_task(machine, qlock, system.now(), $task));
             };
         }
@@ -144,6 +157,7 @@ impl Processor {
                     trace!("{:?} entering sleep", self);
 
                     system.processors_wait_notif();
+                    check_for_help = true;
 
                     #[cfg(feature = "tracing")]
                     trace!("{:?} exiting sleep", self);
@@ -335,8 +349,13 @@ impl Processor {
     }
 
     #[inline(always)]
-    pub fn is_empty(&self) -> bool {
-        self.global.is_empty() && self.stealers[0].is_empty() && self.stealers[1].is_empty()
+    pub fn global_is_empty(&self) -> bool {
+        self.global.is_empty()
+    }
+
+    #[inline(always)]
+    pub fn local_is_empty(&self) -> bool {
+        self.stealers[0].is_empty() && self.stealers[1].is_empty()
     }
 }
 
