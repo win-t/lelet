@@ -77,7 +77,7 @@ impl Processor {
     }
 
     #[inline(always)]
-    pub fn run_on(&self, machine: &Machine) {
+    pub fn run_on(&'static self, machine: &Machine) {
         macro_rules! check {
             ($qlock:expr) => {
                 match $qlock {
@@ -170,7 +170,7 @@ impl Processor {
 
     #[inline(always)]
     fn run_task<'a>(
-        &'a self,
+        &'static self,
         machine: &Machine,
         mut qlock: SimpleLockGuard<'a, Queue>,
         now: u64,

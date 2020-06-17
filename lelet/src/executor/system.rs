@@ -178,16 +178,11 @@ impl System {
 
     #[inline(always)]
     pub fn push(&self, task: Task) {
-        match machine::direct_push(task) {
-            Ok(()) => {}
-            Err(task) => {
-                let mut p = task.tag().processor_hint();
-                if p.is_null() {
-                    p = unsafe { self.processors.get_unchecked(0) };
-                }
-
-                unsafe { &*p }.push_global(task);
-            }
+        if let Err(task) = machine::direct_push(task) {
+            task.tag()
+                .processor_hint()
+                .unwrap_or(unsafe { self.processors.get_unchecked(0) })
+                .push_global(task);
         }
 
         self.sysmon_unparker.unpark();

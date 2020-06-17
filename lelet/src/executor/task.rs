@@ -37,14 +37,14 @@ impl TaskTag {
     }
 
     #[inline(always)]
-    pub fn processor_hint(&self) -> *const Processor {
-        self.processor_hint.load(Ordering::Relaxed)
+    pub fn processor_hint(&self) -> Option<&'static Processor> {
+        unsafe { self.processor_hint.load(Ordering::Relaxed).as_ref() }
     }
 
     #[inline(always)]
-    pub fn set_processor_hint(&self, processor: *const Processor) {
+    pub fn set_processor_hint(&self, processor: &'static Processor) {
         self.processor_hint
-            .store(processor as *mut _, Ordering::Relaxed);
+            .store(processor as *const _ as *mut _, Ordering::Relaxed);
     }
 }
 
