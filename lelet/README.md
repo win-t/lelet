@@ -192,7 +192,7 @@ pub mod compat {
 }
 ```
 
-then test multiple request to `/blocing`, all of them will complete within 5 second
+then test multiple request to `/blocking`, all of them will complete within 5 second
 
 ```bash
 bash -c '
