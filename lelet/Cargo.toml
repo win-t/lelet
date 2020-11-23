@@ -32,7 +32,7 @@ tracing = ["log"]
 
 [dependencies]
 async-task = "3.0.0"
-crossbeam-channel = "0.4.2"
+crossbeam-channel = "0.5.0"
 crossbeam-deque = "0.7.3"
 crossbeam-utils = "0.7.2"
 lelet-utils = "0.3.4"

@@ -3,8 +3,9 @@
 //! The size of thread pool is unbounded, it will always spawn new thread
 //! when no thread available to run the job
 
+use std::hint::unreachable_unchecked;
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Once;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -17,7 +18,7 @@ use std::cell::Cell;
 #[cfg(feature = "tracing")]
 use log::trace;
 
-const IDLE_THRESHOLD: Duration = Duration::from_secs(300); // 5 minutes
+const IDLE_THRESHOLD: Duration = Duration::from_secs(10);
 
 #[cfg(feature = "tracing")]
 pub struct ThreadID(Cell<usize>);
@@ -54,21 +55,19 @@ impl Pool {
         }
     }
 
-    #[inline(always)]
-    fn put_job(&'static self, job: Job) {
+    fn run(&'static self, job: Job) {
         self.sender.try_send(job).unwrap_or_else(|err| match err {
             TrySendError::Full(job) => {
-                thread::spawn(move || self.run());
+                thread::spawn(move || self.main());
                 self.sender.send(job).unwrap();
             }
 
-            // we hold both side of the channel
-            TrySendError::Disconnected(_) => unreachable!(),
+            // we hold both side of the channel, so it will never be disconnected
+            TrySendError::Disconnected(_) => unsafe { unreachable_unchecked() },
         });
     }
 
-    #[inline(always)]
-    fn run(&self) {
+    fn main(&self) {
         #[cfg(feature = "tracing")]
         THREAD_ID.with(|id| {
             static THREAD_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -100,12 +99,12 @@ impl Pool {
                             (now + IDLE_THRESHOLD).duration_since(self.base).as_secs() as usize;
 
                         // only 1 thread is allowed to exit per IDLE_THRESHOLD
-                        // ensure it via CAS
-                        if self.next_exit.compare_and_swap(
-                            next_exit,
-                            new_next_exit,
-                            Ordering::Relaxed,
-                        ) == next_exit
+                        if next_exit
+                            == self.next_exit.compare_and_swap(
+                                next_exit,
+                                new_next_exit,
+                                Ordering::Relaxed,
+                            )
                         {
                             #[cfg(feature = "tracing")]
                             THREAD_ID.with(|id| {
@@ -124,13 +123,16 @@ impl Pool {
     }
 }
 
+impl Pool {
+    fn singleton() -> &'static Pool {
+        static ONCE: Once = Once::new();
+        static mut VAL: *const Pool = ptr::null();
+        ONCE.call_once(|| unsafe { VAL = Box::into_raw(Box::new(Pool::new())) });
+        unsafe { &*VAL }
+    }
+}
+
 /// Spawn the job in the thread pool
-#[inline(always)]
 pub fn spawn_box(job: Job) {
-    static POOL: (AtomicPtr<Pool>, Once) = (AtomicPtr::new(ptr::null_mut()), Once::new());
-    POOL.1.call_once(|| {
-        let pool = Box::into_raw(Box::new(Pool::new()));
-        POOL.0.store(pool, Ordering::Relaxed);
-    });
-    unsafe { &*POOL.0.load(Ordering::Relaxed) }.put_job(job);
+    Pool::singleton().run(job)
 }
