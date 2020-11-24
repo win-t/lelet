@@ -3,12 +3,16 @@
 //! The size of thread pool is unbounded, it will always spawn new thread
 //! when no thread available to run the job
 
-use std::hint::unreachable_unchecked;
-use std::ptr;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Once;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::{
+    hint::unreachable_unchecked,
+    ptr,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Once,
+    },
+    thread,
+    time::{Duration, Instant},
+};
 
 use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TrySendError};
 
@@ -117,7 +121,7 @@ impl Pool {
                 }
 
                 // we hold both side of the channel
-                Err(RecvTimeoutError::Disconnected) => unreachable!(),
+                Err(RecvTimeoutError::Disconnected) => unsafe { unreachable_unchecked() },
             }
         }
     }
