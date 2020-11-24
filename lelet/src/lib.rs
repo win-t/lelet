@@ -13,7 +13,7 @@
 //! [`spawn`]: fn.spawn.html
 
 #[doc(hidden)]
-pub mod thread_pool;
+pub mod thread_cache;
 
 mod executor;
 pub use executor::spawn;

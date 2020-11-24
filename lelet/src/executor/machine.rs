@@ -10,7 +10,7 @@ use log::trace;
 
 use lelet_utils::abort_on_panic;
 
-use crate::thread_pool;
+use crate::thread_cache;
 
 use super::processor::Processor;
 use super::Task;
@@ -61,7 +61,7 @@ impl Machine {
         });
 
         #[cfg(feature = "tracing")]
-        crate::thread_pool::THREAD_ID.with(|tid| {
+        crate::thread_cache::THREAD_ID.with(|tid| {
             trace!("{:?} is running on {:?}", self, tid);
         });
 
@@ -87,7 +87,7 @@ impl Drop for Machine {
 
 #[inline(always)]
 pub fn spawn(processor: &'static Processor) {
-    thread_pool::spawn_box(Box::new(move || {
+    thread_cache::spawn(Box::new(move || {
         abort_on_panic(move || {
             Machine::new(processor).run();
         })
