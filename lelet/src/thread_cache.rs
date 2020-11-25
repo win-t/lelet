@@ -35,7 +35,7 @@ impl Cache {
     fn run(&'static self, job: Job) {
         self.sender.try_send(job).unwrap_or_else(|err| match err {
             TrySendError::Full(job) => {
-                thread::spawn(move || self.main_loop());
+                let _ = thread::Builder::new().spawn(move || self.main_loop());
                 self.sender.send(job).unwrap();
             }
 

@@ -26,7 +26,7 @@ use std::task::{Context, Poll};
 
 use self::task::TaskTag;
 
-type Task = async_task::Task<TaskTag>;
+type Task = async_task_old::Task<TaskTag>;
 
 /// Run the task in the background.
 ///
@@ -43,7 +43,7 @@ where
     R: Send + 'static,
 {
     let system = system::get();
-    let (task, handle) = async_task::spawn(task, move |task| system.push(task), TaskTag::new());
+    let (task, handle) = async_task_old::spawn(task, move |task| system.push(task), TaskTag::new());
     task.schedule();
     JoinHandle(handle)
 }
@@ -53,7 +53,7 @@ where
 /// this struct returned by [`spawn`]
 ///
 /// [`spawn`]: fn.spawn.html
-pub struct JoinHandle<R>(async_task::JoinHandle<R, TaskTag>);
+pub struct JoinHandle<R>(async_task_old::JoinHandle<R, TaskTag>);
 
 impl<R> Future for JoinHandle<R> {
     type Output = R;
