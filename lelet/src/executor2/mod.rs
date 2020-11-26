@@ -1,16 +1,25 @@
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(dead_code)]
+
 use std::{
+    future::Future,
+    pin::Pin,
     ptr,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Once,
     },
+    task::{Context, Poll},
     thread,
     time::Duration,
 };
 
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 
-use lelet_utils::SimpleLock;
+use async_task::{spawn as async_spawn, Runnable, Task};
+
+use lelet_utils::{ready, SimpleLock};
 
 use crate::thread_cache;
 
@@ -27,13 +36,13 @@ macro_rules! try_lock_or_return {
 
 const BLOCKING_TRHESHOLD: Duration = Duration::from_millis(100);
 
-struct Task {}
+struct Job(Runnable);
 
 struct System {
     lock: SimpleLock<()>,
     tick: AtomicUsize,
 
-    global: Injector<Task>,
+    global: Injector<Job>,
 
     executors: Vec<ExecutorData>,
 }
@@ -42,12 +51,12 @@ struct ExecutorData(ExecutorData0, SimpleLock<ExecutorData1>);
 
 struct ExecutorData0 {
     last_tick: AtomicUsize,
-    to_steal: Vec<Stealer<Task>>,
+    to_steal: Vec<Stealer<Job>>,
 }
 
 struct ExecutorData1 {
-    slot: Option<Task>,
-    queue: Worker<Task>,
+    slot: Option<Job>,
+    queue: Worker<Job>,
     counter: usize,
 }
 
@@ -117,9 +126,9 @@ impl System {
     }
 
     fn spawn_executor(&'static self, executor_index: usize) {
-        thread_cache::spawn(Box::new(move || {
-            self.executor_main_loop(executor_index);
-        }));
+        // thread_cache::spawn(Box::new(move || {
+        //     self.executor_main_loop(executor_index);
+        // }));
     }
 
     fn executor_main_loop(&self, executor_index: usize) {
@@ -130,12 +139,12 @@ impl System {
             e.0.last_tick
                 .store(self.tick.load(Ordering::Relaxed), Ordering::Relaxed);
 
-            let t = self.get_task(&e.0, &mut d);
+            let _t = self.get_job(&e.0, &mut d);
             // TODO
         }
     }
 
-    fn get_task(&self, e: &ExecutorData0, d: &mut ExecutorData1) -> Option<Task> {
+    fn get_job(&self, e: &ExecutorData0, d: &mut ExecutorData1) -> Option<Job> {
         d.counter += 1;
         loop {
             let mut retry = false;
@@ -176,6 +185,11 @@ impl System {
             }
         }
     }
+
+    fn push_runnable(&self, j: Job) {
+        self.global.push(j);
+        todo!();
+    }
 }
 
 impl System {
@@ -190,6 +204,15 @@ impl System {
     }
 }
 
-pub fn spawn() {
-    System::get();
+pub async fn spawn<F, R>(f: F) -> R
+where
+    F: Future<Output = R> + Send + 'static,
+    R: Send + 'static,
+{
+    let system = System::get();
+
+    let (r, t) = async_spawn(f, move |r| system.push_runnable(Job(r)));
+    r.schedule();
+
+    t.await
 }

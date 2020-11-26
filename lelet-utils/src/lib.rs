@@ -3,21 +3,22 @@ use std::{
     fmt,
     future::Future,
     marker::PhantomData,
-    mem::forget,
+    mem,
     ops::{Deref, DerefMut},
     pin::Pin,
     process::abort,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Condvar, Mutex,
+        Arc,
     },
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+    thread::{self, Thread},
 };
 
 /// Call [`abort`] when `f` panic
 ///
 /// [`abort`]: https://doc.rust-lang.org/std/process/fn.abort.html
-pub fn abort_on_panic(f: impl FnOnce()) {
+pub fn abort_on_panic<R>(f: impl FnOnce() -> R) -> R {
     struct Bomb;
 
     impl Drop for Bomb {
@@ -28,9 +29,11 @@ pub fn abort_on_panic(f: impl FnOnce()) {
 
     let bomb = Bomb;
 
-    f();
+    let r = f();
 
-    forget(bomb);
+    mem::forget(bomb);
+
+    r
 }
 
 /// Defer the execution until the scope is done
@@ -42,7 +45,7 @@ macro_rules! defer {
 
           impl<F: FnOnce()> Drop for Guard<F> {
             fn drop(&mut self) {
-                  (self.0).take().map(|f| f());
+                  self.0.take().map(|f| f());
               }
           }
 
@@ -86,7 +89,7 @@ impl Future for Yields {
 
 /// A simple lock.
 ///
-/// Intentionally I don't povide `lock`, you can spin loop `try_lock` if you want.
+/// Intentionally to not providing the `lock`, you can spin loop `try_lock` if you want.
 /// You should use [`Mutex`] if you need blocking lock.
 ///
 /// [`Mutex`]: https://doc.rust-lang.org/std/sync/struct.Mutex.html
@@ -193,70 +196,47 @@ impl<T: ?Sized + fmt::Display> fmt::Display for SimpleLockGuard<'_, T> {
 }
 
 /// Block current thread until f is complete
-pub fn block_on<F: Future>(mut f: F) -> F::Output {
-    // originally copied from `extreme` (https://docs.rs/extreme)
-
-    #[allow(clippy::mutex_atomic)]
-    struct Parker(Mutex<bool>, Condvar);
-
-    #[allow(clippy::mutex_atomic)]
-    impl Parker {
-        fn unpark(self: &Parker) {
-            *self.0.lock().unwrap() = true;
-            self.1.notify_one();
-        }
-
-        fn park(self: &Parker) {
-            let mut runnable = self.0.lock().unwrap();
-
-            // wait until runnable
-            while !*runnable {
-                runnable = self.1.wait(runnable).unwrap();
-            }
-
-            // consume runnable flag
-            *runnable = false;
-        }
-    }
-
+pub fn block_on<F: Future>(f: F) -> F::Output {
     static VTABLE: RawWakerVTable = RawWakerVTable::new(
         //
         // clone: unsafe fn(*const ()) -> RawWaker
-        |parker| unsafe {
-            let parker = Arc::from_raw(parker as *const i32);
-            forget(parker.clone());
-            RawWaker::new(Arc::into_raw(parker) as *const (), &VTABLE)
+        |unparker| unsafe {
+            let unparker = Arc::from_raw(unparker as *const Unparker);
+            mem::forget(unparker.clone()); // to inc the Arc's ref count
+            RawWaker::new(Arc::into_raw(unparker) as *const (), &VTABLE)
         },
         //
         // wake: unsafe fn(*const ())
-        |parker| unsafe {
-            let parker = Arc::from_raw(parker as *const Parker);
-            parker.unpark();
+        |unparker| unsafe {
+            Arc::from_raw(unparker as *const Unparker).unpark();
         },
         //
         // wake_by_ref: unsafe fn(*const ())
-        |parker| unsafe {
-            (&*(parker as *const Parker)).unpark();
+        |unparker| unsafe {
+            (&*(unparker as *const Unparker)).unpark();
         },
         //
         // drop: unsafe fn(*const ())
-        |parker| unsafe {
-            let parker = Arc::from_raw(parker as *const Parker);
-            drop(parker);
+        |unparker| unsafe {
+            drop(Arc::from_raw(unparker as *const Unparker));
         },
     );
 
-    let parker = Arc::new(Parker(Mutex::new(false), Condvar::new()));
+    let parker = Parker::new();
 
     let waker = unsafe {
         Waker::from_raw(RawWaker::new(
-            Arc::into_raw(parker.clone()) as *const (),
+            Arc::into_raw(parker.unparker()) as *const (),
             &VTABLE,
         ))
     };
 
+    // pin f to the stack
+    let mut f = f;
     let mut f = unsafe { Pin::new_unchecked(&mut f) };
+
     let mut cx = Context::from_waker(&waker);
+
     loop {
         match f.as_mut().poll(&mut cx) {
             Poll::Pending => parker.park(),
@@ -264,3 +244,71 @@ pub fn block_on<F: Future>(mut f: F) -> F::Output {
         }
     }
 }
+
+struct ParkerInner {
+    parked: AtomicBool,
+    thread: Thread,
+
+    // !Send + !Sync
+    _mark: PhantomData<*mut ()>,
+}
+
+impl ParkerInner {
+    fn new() -> ParkerInner {
+        ParkerInner {
+            parked: AtomicBool::new(false),
+            thread: thread::current(),
+            _mark: PhantomData,
+        }
+    }
+
+    fn park(&self) {
+        // wait while the flag is set
+        while !self.parked.load(Ordering::Relaxed) {
+            thread::park();
+        }
+
+        // consume the flag
+        self.parked.store(false, Ordering::Relaxed);
+    }
+
+    fn unpark(&self) {
+        // set the flag
+        self.parked.store(true, Ordering::Relaxed);
+
+        self.thread.unpark();
+    }
+}
+
+/// A thread parking primitive
+pub struct Parker(Arc<ParkerInner>);
+
+impl Parker {
+    /// Create new Parker
+    pub fn new() -> Parker {
+        Parker(Arc::new(ParkerInner::new()))
+    }
+
+    /// Park current thread
+    pub fn park(&self) {
+        self.0.park();
+    }
+
+    /// Return the associated unparker
+    pub fn unparker(&self) -> Arc<Unparker> {
+        unsafe { mem::transmute(self.0.clone()) }
+    }
+}
+
+/// Unparker for the associated parked thread
+pub struct Unparker(ParkerInner);
+
+impl Unparker {
+    /// Unpark the associated parked thread
+    pub fn unpark(&self) {
+        self.0.unpark();
+    }
+}
+
+unsafe impl Send for Unparker {}
+unsafe impl Sync for Unparker {}
