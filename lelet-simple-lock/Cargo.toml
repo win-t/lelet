@@ -1,0 +1,10 @@
+[package]
+name = "lelet-simple-lock"
+description = "lelet simple lock"
+version = "1.0.0"
+authors = ["Kurnia D Win <kurnia.d.win@gmail.com>"]
+edition = "2018"
+license = "GPL-3.0+"
+repository = "https://github.com/win-t/lelet"
+homepage = "https://github.com/win-t/lelet"
+documentation = "https://docs.rs/lelet-simple-lock"

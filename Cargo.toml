@@ -1,7 +1,9 @@
 [workspace]
 
 members = [
-    "lelet",
+    "lelet-defer",
     "lelet-io",
+    "lelet-simple-lock",
     "lelet-utils",
+    "lelet",
 ]
