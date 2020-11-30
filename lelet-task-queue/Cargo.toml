@@ -1,0 +1,17 @@
+[package]
+name = "lelet-task-queue"
+description = "lelet utils"
+version = "1.0.0"
+authors = ["Kurnia D Win <kurnia.d.win@gmail.com>"]
+edition = "2018"
+license = "GPL-3.0+"
+repository = "https://github.com/win-t/lelet"
+homepage = "https://github.com/win-t/lelet"
+documentation = "https://docs.rs/lelet-task-queue"
+
+[dependencies]
+async-task = "4.0.3"
+crossbeam-deque = "0.8.0"
+crossbeam-utils = "0.8.1"
+fastrand = "1.4.0"
+lelet-defer = "1.0.0"
