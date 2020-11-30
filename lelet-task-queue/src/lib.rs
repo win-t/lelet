@@ -16,17 +16,17 @@ use std::task::Poll;
 
 use crate::poll_fn::poll_fn;
 
-/// Push a task into the queue
+/// Push a task
 pub fn push(task: impl Future<Output = ()> + Send + 'static) {
     shared::push(task);
 }
 
-/// Push a local task into the queue
+/// Push a local task
 pub fn push_local(task: impl Future<Output = ()> + 'static) {
     local::push(task);
 }
 
-/// Poller for polling the tasks in the queue
+/// Poller
 pub struct Poller<'a> {
     local: local::Poller<'a>,
     shared: shared::Poller<'a>,
@@ -69,9 +69,9 @@ impl<'a> Poller<'a> {
         false
     }
 
-    /// Wait until some task is pollable
+    /// Wait
     ///
-    /// return true if there is a task to be polled
+    /// return true if there is a task to be polled, or false if the queue becomes empty
     pub async fn wait(&self) -> bool {
         let mut local_wait = Some(self.local.wait());
         let mut shared_wait = Some(self.shared.wait());
