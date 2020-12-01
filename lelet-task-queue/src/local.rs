@@ -2,6 +2,8 @@ use std::cell::Cell;
 use std::cell::RefCell;
 use std::future::Future;
 use std::marker::PhantomData;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::task::Poll;
@@ -28,7 +30,9 @@ struct Local {
     queue: Arc<Injector<Runnable>>,
 
     // to notify that there is a task to be run
-    wakers: Arc<RwLock<Vec<Waker>>>,
+    // atomic bool is for optimization, it is true when len of vec > 0
+    // atomic bool MUST be writen when holding write lock to the vec
+    wakers: Arc<(AtomicBool, RwLock<Vec<Waker>>)>,
 }
 
 // push new task
@@ -39,7 +43,7 @@ pub fn push(task: impl Future<Output = ()> + 'static) {
             local.borrow_mut().replace(Local {
                 len: Cell::new(0),
                 queue: Arc::new(Injector::new()),
-                wakers: Arc::new(RwLock::new(Vec::new())),
+                wakers: Arc::new((AtomicBool::new(false), RwLock::new(Vec::new()))),
             });
         }
 
@@ -79,22 +83,23 @@ pub fn push(task: impl Future<Output = ()> + 'static) {
 }
 
 #[inline(always)]
-fn wake_all(wakers: &RwLock<Vec<Waker>>) {
-    if wakers
-        .read()
-        .expect("acquiring wakers read lock when wake_all")
-        .is_empty()
-    {
+fn wake_all(wakers: &(AtomicBool, RwLock<Vec<Waker>>)) {
+    if !wakers.0.load(Ordering::Relaxed) {
         return;
     }
 
-    let mut wakers = wakers
+    let mut wakers_lock = wakers
+        .1
         .write()
         .expect("acquiring wakers write lock when wake_all");
 
-    for w in wakers.drain(..) {
+    for w in wakers_lock.drain(..) {
         w.wake();
     }
+
+    wakers.0.store(false, Ordering::Relaxed);
+
+    drop(wakers_lock);
 }
 
 pub struct Poller<'a> {
@@ -168,30 +173,38 @@ impl<'a> Poller<'a> {
                 let waker = cx.waker();
                 let mut need_to_store = true;
 
-                {
-                    let wakers = local
+                if local.wakers.0.load(Ordering::Relaxed) {
+                    let wakers_lock = local
                         .wakers
+                        .1
                         .read()
                         .expect("acquiring wakers read lock on poll");
 
-                    for w in wakers.iter() {
+                    for w in wakers_lock.iter() {
                         if w.will_wake(waker) {
                             need_to_store = false;
                             break;
                         }
                     }
+
+                    drop(wakers_lock);
                 }
 
                 if need_to_store {
-                    let mut wakers = local
+                    let mut wakers_lock = local
                         .wakers
+                        .1
                         .write()
                         .expect("acquiring wakers write lock on poll");
 
                     // check again while holding write lock
                     check!();
 
-                    wakers.push(waker.clone());
+                    wakers_lock.push(waker.clone());
+
+                    local.wakers.0.store(true, Ordering::Relaxed);
+
+                    drop(wakers_lock);
                 }
 
                 Poll::Pending

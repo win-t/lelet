@@ -3,6 +3,7 @@ use std::cell::RefCell;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::ptr;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -35,7 +36,9 @@ struct Shared {
     queue: Injector<Runnable>,
 
     // to notify that there is a task to be run
-    wakers: Arc<RwLock<Vec<Waker>>>,
+    // atomic bool is for optimization, it is true when len of vec > 0
+    // atomic bool MUST be writen when holding write lock to the vec
+    wakers: Arc<(AtomicBool, RwLock<Vec<Waker>>)>,
 
     // stealers for all threads
     stealers: ShardedLock<Vec<(usize, Stealer<Runnable>)>>,
@@ -49,7 +52,7 @@ fn shared() -> &'static Shared {
         let shared = Box::into_raw(Box::new(Shared {
             len: AtomicUsize::new(0),
             queue: Injector::new(),
-            wakers: Arc::new(RwLock::new(Vec::new())),
+            wakers: Arc::new((AtomicBool::new(false), RwLock::new(Vec::new()))),
             stealers: ShardedLock::new(Vec::new()),
         }));
         unsafe { SHARED = shared }
@@ -65,7 +68,7 @@ pub fn push(task: impl Future<Output = ()> + Send + 'static) {
         defer! {
             // if this is last task
             if shared().len.fetch_sub(1, Ordering::Relaxed) == 1 {
-                wake_all();
+                wake_all(&shared().wakers);
             }
         }
         task.await;
@@ -89,7 +92,7 @@ pub fn push(task: impl Future<Output = ()> + Send + 'static) {
             shared().queue.push(r)
         }
 
-        wake_all();
+        wake_all(&shared().wakers);
     };
     let (r, t) = unsafe { async_task::spawn_unchecked(task, schedule) };
     t.detach();
@@ -97,24 +100,23 @@ pub fn push(task: impl Future<Output = ()> + Send + 'static) {
 }
 
 #[inline(always)]
-fn wake_all() {
-    if shared()
-        .wakers
-        .read()
-        .expect("acquiring wakers read lock when wake_all")
-        .is_empty()
-    {
+fn wake_all(wakers: &(AtomicBool, RwLock<Vec<Waker>>)) {
+    if !wakers.0.load(Ordering::Relaxed) {
         return;
     }
 
-    let mut wakers = shared()
-        .wakers
+    let mut wakers_lock = wakers
+        .1
         .write()
         .expect("acquiring wakers write lock when wake_all");
 
-    for w in wakers.drain(..) {
+    for w in wakers_lock.drain(..) {
         w.wake();
     }
+
+    wakers.0.store(false, Ordering::Relaxed);
+
+    drop(wakers_lock);
 }
 
 struct Local {
@@ -132,14 +134,14 @@ impl Local {
         let stealer = queue.stealer();
 
         // add this stealer to SHARED
-        {
-            let mut stealers = shared()
-                .stealers
-                .write()
-                .expect("acquiring stealers write lock when Local::new");
+        let mut stealers_lock = shared()
+            .stealers
+            .write()
+            .expect("acquiring stealers write lock when Local::new");
 
-            stealers.push((id, stealer));
-        }
+        stealers_lock.push((id, stealer));
+
+        drop(stealers_lock);
 
         Local {
             id,
@@ -157,14 +159,19 @@ impl Drop for Local {
         }
 
         // remove this stealer from SHARED
-        {
-            let mut stealers = shared()
-                .stealers
-                .write()
-                .expect("acquiring stealers write lock when Local::drop");
+        let mut stealers_lock = shared()
+            .stealers
+            .write()
+            .expect("acquiring stealers write lock when Local::drop");
 
-            stealers.retain(|s| self.id != s.0);
+        let last = stealers_lock.len() - 1;
+        let pos = stealers_lock.iter().position(|s| self.id == s.0).unwrap();
+        if pos != last {
+            stealers_lock.swap(pos, last);
         }
+        stealers_lock.pop();
+
+        drop(stealers_lock);
     }
 }
 
@@ -260,23 +267,23 @@ impl<'a> Poller<'a> {
                 }
 
                 // try to steal from others
-                {
-                    let stealers = shared()
-                        .stealers
-                        .read()
-                        .expect("acquiring stealers read lock when Poller::pull_once");
+                let stealers_lock = shared()
+                    .stealers
+                    .read()
+                    .expect("acquiring stealers read lock when Poller::pull_once");
 
-                    let (l, r) = stealers.split_at(fastrand::usize(..stealers.len()));
-                    for t in r.iter().chain(l) {
-                        match t.1.steal_batch_and_pop(&local.queue) {
-                            Steal::Empty => {}
-                            Steal::Success(r) => {
-                                run_runnable!(r);
-                            }
-                            Steal::Retry => retry = true,
+                let (l, r) = stealers_lock.split_at(fastrand::usize(..stealers_lock.len()));
+                for t in r.iter().chain(l) {
+                    match t.1.steal_batch_and_pop(&local.queue) {
+                        Steal::Empty => {}
+                        Steal::Success(r) => {
+                            run_runnable!(r);
                         }
+                        Steal::Retry => retry = true,
                     }
                 }
+
+                drop(stealers_lock);
 
                 if !retry {
                     return false;
@@ -301,51 +308,57 @@ impl<'a> Poller<'a> {
                         return Poll::Ready(true);
                     }
 
-                    {
-                        let stealers = shared()
-                            .stealers
-                            .read()
-                            .expect("acquiring stealers read lock when Poller::wait");
+                    let stealers_lock = shared()
+                        .stealers
+                        .read()
+                        .expect("acquiring stealers read lock when Poller::wait");
 
-                        let (l, r) = stealers.split_at(fastrand::usize(..stealers.len()));
-                        for t in r.iter().chain(l) {
-                            if !t.1.is_empty() {
-                                return Poll::Ready(true);
-                            }
+                    let (l, r) = stealers_lock.split_at(fastrand::usize(..stealers_lock.len()));
+                    for t in r.iter().chain(l) {
+                        if !t.1.is_empty() {
+                            return Poll::Ready(true);
                         }
                     }
+
+                    drop(stealers_lock);
                 };
             }
-
-            check!();
 
             let waker = cx.waker();
             let mut need_to_store = true;
 
-            {
-                let wakers = shared()
+            if shared().wakers.0.load(Ordering::Relaxed) {
+                let wakers_lock = shared()
                     .wakers
+                    .1
                     .read()
-                    .expect("acquiring wakers read lock on Poller::wait");
+                    .expect("acquiring wakers read lock on poll");
 
-                for w in wakers.iter() {
+                for w in wakers_lock.iter() {
                     if w.will_wake(waker) {
                         need_to_store = false;
                         break;
                     }
                 }
+
+                drop(wakers_lock);
             }
 
             if need_to_store {
-                let mut wakers = shared()
+                let mut wakers_lock = shared()
                     .wakers
+                    .1
                     .write()
-                    .expect("acquiring wakers write lock on Poller::wait");
+                    .expect("acquiring wakers write lock on poll");
 
                 // check again while holding write lock
                 check!();
 
-                wakers.push(waker.clone());
+                wakers_lock.push(waker.clone());
+
+                shared().wakers.0.store(true, Ordering::Relaxed);
+
+                drop(wakers_lock);
             }
 
             Poll::Pending

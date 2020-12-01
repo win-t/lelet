@@ -57,6 +57,7 @@ impl<'a> Poller<'a> {
     /// use [`wait`] to check if the queue is already empty
     ///
     /// [`wait`]: struct.Poller.html#method.wait
+    #[inline(always)]
     pub fn poll_one(&self) -> bool {
         if self.local.poll_one() {
             return true;
@@ -72,12 +73,15 @@ impl<'a> Poller<'a> {
     /// Wait
     ///
     /// return true if there is a task to be polled, or false if the queue becomes empty
+    #[inline(always)]
     pub async fn wait(&self) -> bool {
         let mut local_wait = Some(self.local.wait());
         let mut shared_wait = Some(self.shared.wait());
-        let mut done = false;
         poll_fn(move |cx| {
-            assert!(!done, "calling poll when future is already done");
+            assert!(
+                local_wait.is_none() && shared_wait.is_none(),
+                "calling poll when future is already done"
+            );
 
             if local_wait.is_some() {
                 let f = local_wait.as_mut().unwrap();
@@ -85,7 +89,6 @@ impl<'a> Poller<'a> {
                     Poll::Ready(ok) => {
                         local_wait.take();
                         if ok {
-                            done = true;
                             return Poll::Ready(true);
                         }
                     }
@@ -99,7 +102,6 @@ impl<'a> Poller<'a> {
                     Poll::Ready(ok) => {
                         shared_wait.take();
                         if ok {
-                            done = true;
                             return Poll::Ready(true);
                         }
                     }
@@ -110,7 +112,6 @@ impl<'a> Poller<'a> {
             if local_wait.is_some() || shared_wait.is_some() {
                 Poll::Pending
             } else {
-                done = true;
                 Poll::Ready(false)
             }
         })
