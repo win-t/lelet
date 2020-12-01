@@ -79,7 +79,7 @@ impl<'a> Poller<'a> {
         let mut shared_wait = Some(self.shared.wait());
         poll_fn(move |cx| {
             assert!(
-                local_wait.is_none() && shared_wait.is_none(),
+                local_wait.is_some() || shared_wait.is_some(),
                 "calling poll when future is already done"
             );
 
@@ -89,6 +89,7 @@ impl<'a> Poller<'a> {
                     Poll::Ready(ok) => {
                         local_wait.take();
                         if ok {
+                            shared_wait.take();
                             return Poll::Ready(true);
                         }
                     }
@@ -102,6 +103,7 @@ impl<'a> Poller<'a> {
                     Poll::Ready(ok) => {
                         shared_wait.take();
                         if ok {
+                            local_wait.take();
                             return Poll::Ready(true);
                         }
                     }

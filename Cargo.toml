@@ -4,6 +4,7 @@ members = [
     "lelet-defer",
     "lelet-io",
     "lelet-simple-lock",
+    "lelet-task-queue",
     "lelet-utils",
     "lelet",
 ]

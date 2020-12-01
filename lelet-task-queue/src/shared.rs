@@ -3,7 +3,6 @@ use std::cell::RefCell;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::ptr;
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -36,9 +35,7 @@ struct Shared {
     queue: Injector<Runnable>,
 
     // to notify that there is a task to be run
-    // atomic bool is for optimization, it is true when len of vec > 0
-    // atomic bool MUST be writen when holding write lock to the vec
-    wakers: Arc<(AtomicBool, RwLock<Vec<Waker>>)>,
+    wakers: Arc<RwLock<Vec<Waker>>>,
 
     // stealers for all threads
     stealers: ShardedLock<Vec<(usize, Stealer<Runnable>)>>,
@@ -52,7 +49,7 @@ fn shared() -> &'static Shared {
         let shared = Box::into_raw(Box::new(Shared {
             len: AtomicUsize::new(0),
             queue: Injector::new(),
-            wakers: Arc::new((AtomicBool::new(false), RwLock::new(Vec::new()))),
+            wakers: Arc::new(RwLock::new(Vec::new())),
             stealers: ShardedLock::new(Vec::new()),
         }));
         unsafe { SHARED = shared }
@@ -100,21 +97,22 @@ pub fn push(task: impl Future<Output = ()> + Send + 'static) {
 }
 
 #[inline(always)]
-fn wake_all(wakers: &(AtomicBool, RwLock<Vec<Waker>>)) {
-    if !wakers.0.load(Ordering::Relaxed) {
+fn wake_all(wakers: &RwLock<Vec<Waker>>) {
+    if wakers
+        .read()
+        .expect("acquiring wakers read lock when wake_all")
+        .is_empty()
+    {
         return;
     }
 
     let mut wakers_lock = wakers
-        .1
         .write()
         .expect("acquiring wakers write lock when wake_all");
 
     for w in wakers_lock.drain(..) {
         w.wake();
     }
-
-    wakers.0.store(false, Ordering::Relaxed);
 
     drop(wakers_lock);
 }
@@ -324,30 +322,28 @@ impl<'a> Poller<'a> {
                 };
             }
 
+            check!();
+
             let waker = cx.waker();
             let mut need_to_store = true;
 
-            if shared().wakers.0.load(Ordering::Relaxed) {
-                let wakers_lock = shared()
-                    .wakers
-                    .1
-                    .read()
-                    .expect("acquiring wakers read lock on poll");
+            let wakers_lock = shared()
+                .wakers
+                .read()
+                .expect("acquiring wakers read lock on poll");
 
-                for w in wakers_lock.iter() {
-                    if w.will_wake(waker) {
-                        need_to_store = false;
-                        break;
-                    }
+            for w in wakers_lock.iter() {
+                if w.will_wake(waker) {
+                    need_to_store = false;
+                    break;
                 }
-
-                drop(wakers_lock);
             }
+
+            drop(wakers_lock);
 
             if need_to_store {
                 let mut wakers_lock = shared()
                     .wakers
-                    .1
                     .write()
                     .expect("acquiring wakers write lock on poll");
 
@@ -355,8 +351,6 @@ impl<'a> Poller<'a> {
                 check!();
 
                 wakers_lock.push(waker.clone());
-
-                shared().wakers.0.store(true, Ordering::Relaxed);
 
                 drop(wakers_lock);
             }
