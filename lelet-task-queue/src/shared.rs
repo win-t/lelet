@@ -268,7 +268,7 @@ impl<'a> Poller<'a> {
                 let stealers_lock = shared()
                     .stealers
                     .read()
-                    .expect("acquiring stealers read lock when Poller::pull_once");
+                    .expect("acquiring stealers read lock when Poller::poll_one");
 
                 let (l, r) = stealers_lock.split_at(fastrand::usize(..stealers_lock.len()));
                 for t in r.iter().chain(l) {
