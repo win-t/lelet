@@ -6,8 +6,13 @@ use std::process::abort;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-use std::thread::{self, Thread};
+use std::task::Context;
+use std::task::Poll;
+use std::task::RawWaker;
+use std::task::RawWakerVTable;
+use std::task::Waker;
+use std::thread;
+use std::thread::Thread;
 
 /// Call [`abort`] when `f` panic
 ///
@@ -51,47 +56,27 @@ impl Future for Yields {
 /// Block current thread until f is complete
 pub fn block_on<F: Future>(f: F) -> F::Output {
     static VTABLE: RawWakerVTable = RawWakerVTable::new(
-        //
-        // clone: unsafe fn(*const ()) -> RawWaker
-        |unparker| unsafe {
-            let unparker = Arc::from_raw(unparker as *const Unparker);
-            mem::forget(unparker.clone()); // to inc the Arc's ref count
-            RawWaker::new(Arc::into_raw(unparker) as *const (), &VTABLE)
+        |clone_me| {
+            let clone_me = unsafe { Arc::from_raw(clone_me as *const Unparker) };
+            mem::forget(clone_me.clone());
+            RawWaker::new(Arc::into_raw(clone_me) as *const (), &VTABLE)
         },
-        //
-        // wake: unsafe fn(*const ())
-        |unparker| unsafe {
-            Arc::from_raw(unparker as *const Unparker).unpark();
-        },
-        //
-        // wake_by_ref: unsafe fn(*const ())
-        |unparker| unsafe {
-            (&*(unparker as *const Unparker)).unpark();
-        },
-        //
-        // drop: unsafe fn(*const ())
-        |unparker| unsafe {
-            drop(Arc::from_raw(unparker as *const Unparker));
-        },
+        |wake_me| unsafe { Arc::from_raw(wake_me as *const Unparker) }.unpark(),
+        |wake_me_by_ref| unsafe { &*(wake_me_by_ref as *const Unparker) }.unpark(),
+        |drop_me| drop(unsafe { Arc::from_raw(drop_me as *const Unparker) }),
     );
 
     let parker = Parker::new();
 
-    let waker = unsafe {
-        Waker::from_raw(RawWaker::new(
-            Arc::into_raw(parker.unparker()) as *const (),
-            &VTABLE,
-        ))
+    let waker = {
+        let raw = RawWaker::new(Arc::into_raw(parker.unparker()) as *const (), &VTABLE);
+        unsafe { Waker::from_raw(raw) }
     };
 
-    // pin f to the stack
     let mut f = f;
-    let mut f = unsafe { Pin::new_unchecked(&mut f) };
-
     let mut cx = Context::from_waker(&waker);
-
     loop {
-        match f.as_mut().poll(&mut cx) {
+        match unsafe { Pin::new_unchecked(&mut f) }.poll(&mut cx) {
             Poll::Pending => parker.park(),
             Poll::Ready(val) => return val,
         }
@@ -103,7 +88,7 @@ struct ParkerInner {
     thread: Thread,
 
     // !Send + !Sync
-    _mark: PhantomData<*mut ()>,
+    _marker: PhantomData<*mut ()>,
 }
 
 impl ParkerInner {
@@ -111,7 +96,7 @@ impl ParkerInner {
         ParkerInner {
             parked: AtomicBool::new(false),
             thread: thread::current(),
-            _mark: PhantomData,
+            _marker: PhantomData,
         }
     }
 
@@ -149,7 +134,8 @@ impl Parker {
 
     /// Return the associated unparker
     pub fn unparker(&self) -> Arc<Unparker> {
-        unsafe { mem::transmute(self.0.clone()) }
+        let cloned = self.0.clone();
+        unsafe { mem::transmute(cloned) }
     }
 }
 
