@@ -6,15 +6,15 @@
 macro_rules! defer {
     ($($body:tt)*) => {
         let _guard = {
-            struct Guard<F: Fn()>(F);
+            struct Guard<F: FnOnce()>(Option<F>);
 
-            impl<F: Fn()> Drop for Guard<F> {
+            impl<F: FnOnce()> Drop for Guard<F> {
                 fn drop(&mut self) {
-                    (self.0)();
+                    self.0.take().map(|f| f());
                 }
             }
 
-            Guard(|| { $($body)* })
+            Guard(Some(|| { $($body)* ;}))
         };
     };
 }
